@@ -17,6 +17,7 @@
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
+    build: '20260917-expiry-gate',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -421,6 +422,10 @@
         var p = JSON.parse(b64url(String(token).split('.')[1]));
         exp = (p && p.exp) || 0;
       } catch (e) {}
+      // 过期 token 直接拒收：冷打开旧对话时 SSR 残留的是上一个 run 的死 token，
+      // 收下只会占槽（!run.token 守卫挡掉之后的新 token）再判 token-expired 走死。
+      // 无 exp 声明则放行（无法判断）。自救/自取的新 token 自然新鲜，不受影响。
+      if (exp && Date.now() > exp * 1000) return;
       stopPoll();
       run.token = token;
       var sid = sessionIdFromToken(token);
@@ -753,7 +758,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260917-expiry-gate', hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -1051,6 +1056,12 @@
       const html = (document.documentElement && document.documentElement.outerHTML) || '';
       const m = TOKEN_RE.exec(html.slice(0, 4 * 1024 * 1024));
       if (m && m[1]) {
+        // 过期残留不喂（页面 acceptToken 同源注释）：旧对话 SSR 里就是死 token，
+        // 喂进去占槽又走死；解不出 exp 的放行，页面世界还会再鉴一次。
+        try {
+          const pay = JSON.parse(atob(m[1].split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+          if (pay && pay.exp && Date.now() > pay.exp * 1000) return;
+        } catch (e) { /* 解不出就放行 */ }
         log('seed run token from page html');
         window.dispatchEvent(new CustomEvent('knowmodel-run-token-seed', { detail: { token: m[1] } }));
       }
