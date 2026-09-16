@@ -92,18 +92,37 @@ var KnowModelDetector = (() => {
         /* 忽略 */
       }
     }
-    // 次选：文字里包含全名（如 "Demo-A ▾"）
+    // 次选：文字里以完整词形式出现全名（如 "Demo-A ▾"）。
+    // 必须是词边界匹配：目录里混入过名为 test 的测试条目，子串匹配会把
+    // 用户挂载的 test_env.py 文件牌误认成模型（"test" ⊂ "test_env.py"）。
     let best = null;
     for (const el of els) {
       const t = textOf(el);
       if (!t || t.length > 80) continue;
       for (const name of Object.keys(idx.byExact)) {
         if (name.length < 3) continue;
-        if (t.indexOf(name) !== -1 && (!best || name.length > best.length)) best = name;
+        if (containsWord(t, name) && (!best || name.length > best.length)) best = name;
       }
     }
     if (best) return { model: idx.byExact[best], via: 'selector' };
     return null;
+  }
+
+  // 子串必须前后都是非词字符（Unicode 字母/数字/下划线算词字符，CJK 自然成界）。
+  function containsWord(haystack, needle) {
+    const h = String(haystack).toLowerCase();
+    const n = String(needle).toLowerCase();
+    if (!n) return false;
+    const isW = (ch) => !!ch && /[\p{L}\p{N}_]/u.test(ch);
+    let from = 0;
+    for (;;) {
+      const at = h.indexOf(n, from);
+      if (at === -1) return false;
+      const before = at > 0 ? h[at - 1] : '';
+      const after = at + n.length < h.length ? h[at + n.length] : '';
+      if (!isW(before) && !isW(after)) return true;
+      from = at + 1;
+    }
   }
 
   // 投票按钮是匿名对战的最强信号（A is better / Tie / 投票 / 平局 …）
@@ -141,7 +160,7 @@ var KnowModelDetector = (() => {
   // initialModels 本身含全部 id，所以只在没抓到列表时调用（deep 模式，见 content.js）。
   // TEMP-DIAG：同步收集 uuid 样本与计数，供诊断包定位用，定位后可删 sample 字段。
   function scanPageIds(doc, idx) {
-    const st = { found: [], scanned: 0, htmlLen: 0, hasCatalog: false, sample: [] };
+    const st = { found: [], scanned: 0, htmlLen: 0, hasCatalog: false, sample: [], keyCtx: {}, truncated: false };
     let html = '';
     try {
       html = doc.documentElement.outerHTML || '';
@@ -165,7 +184,20 @@ var KnowModelDetector = (() => {
       const hit = idx.byId[m[0]] || idx.byId[tok];
       if (hit && !seen[hit.id]) {
         seen[hit.id] = true;
-        st.found.push(hit);
+        if (st.found.length < 50) st.found.push(hit);
+        else st.truncated = true;
+        // TEMP-DIAG：命中 id 前最近的 JSON key（只记结构不记内容），
+        // 用来分辨这是 modelId 还是 availableModels 之类的名单。
+        try {
+          const tail = html.slice(Math.max(0, m.index - 160), m.index);
+          let key = '(none)';
+          const kre = /"([A-Za-z0-9_$]+)"\s*:/g;
+          let kmt;
+          while ((kmt = kre.exec(tail)) !== null) key = kmt[1];
+          st.keyCtx[key] = (st.keyCtx[key] || 0) + 1;
+        } catch (e) {
+          /* 记账失败跳过 */
+        }
       }
       if (st.found.length >= 2 && st.sample.length >= 30) break;
     }
@@ -204,6 +236,7 @@ var KnowModelDetector = (() => {
       uuidScanned: scan.scanned,
       uuidSample: scan.sample,
       idHits: scan.found.map((m) => (m && m.publicName) || ''),
+      idKeyCtx: scan.keyCtx || {},
       btnCount: btns.length,
       btnTexts: btnTexts,
       ariaLabels: ariaLabels,
@@ -229,8 +262,13 @@ var KnowModelDetector = (() => {
       if (idHits.length === 1) {
         return { mode: 'direct', revealed: false, models: [toInfo(idHits[0])], source: 'page-data' };
       }
-      if (idHits.length > 1) {
+      if (idHits.length === 2) {
         return { mode: 'battle', revealed: true, models: idHits.map((m) => toInfo(m)), source: 'page-data' };
+      }
+      if (idHits.length > 2) {
+        // agent 页会内嵌几十个模型 id 的名单（如可用模型 roster），不是对战揭晓：
+        // 3 个及以上命中判存疑，不下结论，候选名单进诊断供定位。
+        return { mode: 'unknown', revealed: false, models: [], source: 'page-data-ambiguous', candidates: idHits.map((m) => toInfo(m)) };
       }
     }
     return { mode: 'unknown', revealed: false, models: [], source: 'none' };

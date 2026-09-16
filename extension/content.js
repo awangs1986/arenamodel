@@ -12,6 +12,8 @@
 (() => {
   // 本页抓到过 initialModels（首页/榜单）时，网络命中的 id 只是列表噪音，直接忽略。
   let listFoundOnPage = false;
+  // 最近一次识别的存疑候选（页面数据命中 ≥3 个时），只进诊断不进结论。
+  let lastCandidates = [];
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
@@ -133,6 +135,7 @@
     try {
       const models = await getStoredModels();
       const st = KnowModelDetector.detect(location.href, document, models, { deep: !!deep });
+      lastCandidates = ((st && st.candidates) || []).map((m) => (m && m.publicName) || '');
       let payload = {
         mode: st.mode,
         revealed: !!st.revealed,
@@ -461,6 +464,7 @@
         mode: chat && chat.mode,
         source: chat && chat.source,
         modelNames: ((chat && chat.models) || []).map((m) => m.publicName),
+        candidates: lastCandidates.slice(0, 10),
         stats: pageStats(models && models.length ? models : await getStoredModels()),
       });
       if (diag.events.length > 20) diag.events.shift();
