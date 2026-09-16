@@ -220,8 +220,12 @@ async function loadDiag() {
     '轨迹：' + (function () {
       const r = (diag.net && diag.net.run) || null;
       if (!r || !r.hasToken) {
-        let s = '无 token（发一句话后再看）· 流 ' + (r ? r.taps || 0 : 0) + ' · 消息 ' + (r ? r.sockMsgs || 0 : 0);
+        let s = '无 token（发一句话后再看）· 流 ' + (r ? r.taps || 0 : 0) + ' · 已搜 ' + (r ? r.searchedKB || 0 : 0) + 'KB · 消息 ' + (r ? r.sockMsgs || 0 : 0);
         if (r && r.reqRuns && r.reqRuns.length) s += ' · 请求见runId：' + r.reqRuns.join(',');
+        const streams = (r && r.streams) || [];
+        for (const e of streams.slice(-6)) {
+          s += '\n　主干流 ' + (e.kb || 0) + 'KB' + (e.tok ? ' 命中!' : '') + ' | ' + (e.ct || '无CT') + ' | ' + (e.u || '');
+        }
         const log = (r && r.tapLog) || [];
         for (const e of log.slice(-4)) {
           s += '\n　流 ' + (e.tap ? '旁路' : '跳过') + ' ' + (e.kb || 0) + 'KB' + (e.tok ? ' 命中!' : '') + ' | ' + (e.ct || '无CT') + ' | ' + (e.u || '');
@@ -230,6 +234,7 @@ async function loadDiag() {
       }
       if (r.found) return '已解析：' + r.found;
       if (r.error) return '轮询中（' + r.fetches + ' 次），最近：' + r.error;
+      if (!r.runId && r.sess) return '已拿会话 ' + r.sess + '…，排水分发 run 中（' + r.fetches + ' 次）';
       return '轮询中（' + r.fetches + ' 次），runId=' + (r.runId || '?');
     })(),
   ];

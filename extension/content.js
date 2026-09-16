@@ -301,7 +301,10 @@
     // JWT 形态兜底：token 若换了个键名（如 runToken/token），TOKEN_RE 的
     // access-token 标签就抓瞎。兜底按形态找 JWT 再验 scope（read:runs:run_）。
     var JWT_ANY_RE = /eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]+/g;
-    var run = { token: null, runId: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, tapLog: [], reqRuns: [] };
+    // 会话制正门形态：{"token": "eyJ..."}（键名就是 token，无 access-token 标签）。
+    var TOKEN_JSON_RE = /"(?:public-access-token|access-token|token|runToken)"\s*:\s*"(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"/;
+    var REALTIME_BASE = 'https://api.trigger.dev';
+    var run = { token: null, runId: null, sess: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqRuns: [] };
     // 跳过的条目不值得每次都刷诊断（storage 写太频繁）；节流到 2s 一次。
     // 旁路的流由 watchStream 即时 emit，这里只管“跳过”那一侧。
     var lastTapEmit = 0;
@@ -334,6 +337,21 @@
       } catch (e) {}
       return null;
     }
+    // 会话制：scopes 里是 read/write:sessions:<uuid>（uuid 即对话 id），无 run_xxx。
+    function sessionIdFromToken(token) {
+      try {
+        var parts = String(token).split('.');
+        if (parts.length < 2) return null;
+        var p = JSON.parse(b64url(parts[1]));
+        if (!p) return null;
+        var scopes = p.scopes || [];
+        for (var i = 0; i < scopes.length; i++) {
+          var m = String(scopes[i]).match(/^(?:read|write):sessions:([0-9a-fA-F-]{8,})/);
+          if (m) return m[1];
+        }
+      } catch (e) {}
+      return null;
+    }
     function extractLabels(text) {
       var models = [];
       if (typeof text !== 'string' || !text) return models;
@@ -349,6 +367,11 @@
         var m = TOKEN_RE.exec(text || '');
         if (m) return m[2];
       } catch (e) {}
+      // 会话制正门：{"token": JWT} 无标签可循，按 JSON 键名精确抓。
+      try {
+        var j = TOKEN_JSON_RE.exec(text || '');
+        if (j && j[1] && tokenHasRunScope(j[1])) return j[1];
+      } catch (e2) {}
       return findTokenByScope(text);
     }
     // 热路径（流式分片）只用标签版，避免每片全量扫形态；阈值处再调全量版。
@@ -358,12 +381,16 @@
         return m ? m[2] : null;
       } catch (e) { return null; }
     }
+    // 会话制 token（read:sessions:<uuid>）同样接受：run 由后面的
+    // out/records 排水分发，不再要求自带 read:runs。
     function tokenHasRunScope(token) {
       try {
         var p = JSON.parse(b64url(String(token).split('.')[1]));
         var scopes = (p && p.scopes) || [];
         for (var i = 0; i < scopes.length; i++) {
-          if (/read:runs:run_/.test(String(scopes[i]))) return true;
+          var s = String(scopes[i]);
+          if (/(?:read|write):runs:run_/.test(s)) return true;
+          if (/(?:read|write):sessions:/.test(s)) return true;
         }
       } catch (e) {}
       return false;
@@ -396,10 +423,16 @@
       } catch (e) {}
       stopPoll();
       run.token = token;
+      var sid = sessionIdFromToken(token);
+      if (sid) run.sess = sid;
       // 原版：rid 解不出时保留旧 runId（同一 run 的续期 token 仍可用）。
-      run.runId = rid || run.runId;
+      // 会话制例外：新会话 token 配旧 runId 会拿着错钥匙 403，必须清掉走排水分发。
+      if (rid) run.runId = rid;
+      else if (sid) run.runId = null;
+      else run.runId = run.runId;
       run.exp = exp;
       run.fetches = 0;
+      run.sessTries = 0;
       run.found = null;
       run.error = '';
       emitStats();
@@ -415,6 +448,8 @@
     function pollOnce() {
       run.tries++;
       var token = run.token, rid = run.runId;
+      // 会话制第一步：有会话无 run，先排水分发拿 run（不耗 tries 配额）。
+      if (token && !rid && run.sess) { fetchSessionRun(); return; }
       if (!token || !rid) { run.error = 'no-token'; stopPoll(); emitStats(); return; }
       // 同原版 fetchRunModels：过期就不再打了（早停，不耗到 30 次）。
       if (run.exp && Date.now() > run.exp * 1000) { run.error = 'token-expired'; stopPoll(); emitStats(); return; }
@@ -459,8 +494,124 @@
         emitStats();
       });
     }
+    // 会话制排水分发：GET realtime/.../out/records 取尾部记录，找 turn-complete
+    // 控制记录的 public-access-token 头（run 权限），再走原版 events 链。
+    // 30 次配额与 events 共用：排水分发 3 次拿不到 run 就停，不空转。
+    function fetchSessionRun() {
+      if (run.sessTries === undefined) run.sessTries = 0;
+      run.sessTries++;
+      run.fetches++;
+      emitStats();
+      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+      var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 20000);
+      var done = function () { try { clearTimeout(timer); } catch (e) {} };
+      fetch(REALTIME_BASE + '/realtime/v1/sessions/' + encodeURIComponent(run.sess) + '/out/records', {
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + run.token, 'Accept': 'application/json' },
+        credentials: 'omit',
+        signal: ctrl ? ctrl.signal : undefined,
+      }).then(function (res) {
+        if (!res.ok) throw new Error('http-' + res.status);
+        return res.text();
+      }).then(function (text) {
+        done();
+        run.error = '';
+        // 从尾往前找最后一条 turn-complete 的 public-access-token（最新一轮）。
+        var lastTok = null;
+        try {
+          var d = JSON.parse(text);
+          var recs = (d && d.records) || [];
+          for (var i = recs.length - 1; i >= 0; i--) {
+            var hs = recs[i] && recs[i].headers;
+            if (!hs) continue;
+            var isTC = false, pt = null;
+            for (var k = 0; k < hs.length; k++) {
+              if (hs[k] && hs[k][0] === 'trigger-control' && String(hs[k][1]).indexOf('turn-complete') >= 0) isTC = true;
+              if (hs[k] && hs[k][0] === 'public-access-token' && typeof hs[k][1] === 'string') pt = hs[k][1];
+            }
+            if (isTC && pt) { lastTok = pt; break; }
+          }
+        } catch (e) {}
+        if (!lastTok) {
+          // 兜底：记录体里按形态找带 run 权限的 JWT（头字段若改名仍能活）。
+          try {
+            JWT_ANY_RE.lastIndex = 0;
+            var n = 0, mm;
+            while ((mm = JWT_ANY_RE.exec(text || '')) !== null) {
+              if (++n > 40) break;
+              if (JWT_SHAPE_RE.test(mm[0]) && runIdFromToken(mm[0])) { lastTok = mm[0]; break; }
+            }
+          } catch (e2) {}
+        }
+        var rid2 = lastTok ? runIdFromToken(lastTok) : null;
+        if (lastTok && rid2) {
+          run.token = lastTok;
+          run.runId = rid2;
+          try { var pp = JSON.parse(b64url(String(lastTok).split('.')[1])); run.exp = (pp && pp.exp) || 0; } catch (e3) {}
+          run.error = '';
+          emitStats();
+          pollOnce();
+        } else if (run.tries >= 30 || run.sessTries >= 3) {
+          run.error = run.tries >= 30 ? 'timeout' : 'no-run-yet';
+          stopPoll();
+          emitStats();
+        } else {
+          // 本轮还没 turn-complete（刚发送）：不等 6s，2s 后再排一次。
+          run.error = '';
+          emitStats();
+          try { setTimeout(function () { if (run.polling) pollOnce(); }, 2000); } catch (e4) {}
+        }
+      }).catch(function (err) {
+        done();
+        var msg = String((err && err.name === 'AbortError') ? 'timeout-20s' : ((err && err.message) || err));
+        run.error = msg.slice(0, 80);
+        if (run.tries >= 30) stopPoll();
+        emitStats();
+      });
+    }
+    // 主动取 token：会话制下 token 按会话缓存，后几轮页面不再请求正门，
+    // 等是等不来的；页面 cookie 还在，自己 GET 一次即可（幂等、无副作用）。
+    var tokenFetching = false, directTries = 0;
+    function fetchDirectToken() {
+      if (tokenFetching || run.token) return;
+      tokenFetching = true;
+      try {
+        fetch('/api/chat/trigger-token', { credentials: 'same-origin' }).then(function (res) {
+          tokenFetching = false;
+          if (!res || !res.ok) return null;
+          return res.text();
+        }).then(function (t) {
+          try {
+            if (!t || run.token) return;
+            var mm = TOKEN_JSON_RE.exec(t);
+            if (mm && mm[1]) acceptToken(mm[1]);
+          } catch (e) {}
+        }).catch(function () { try { tokenFetching = false; } catch (e) {} });
+      } catch (e) { try { tokenFetching = false; } catch (e2) {} }
+    }
+    // 自愈：snoop 就绪 8s 后仍无 token 且在会话页，自己敲一次正门；切页重来。
+    function maybeDirectToken() {
+      try {
+        if (run.token || directTries >= 3) return;
+        if (typeof location === 'undefined' || !/(agent|chat)/i.test(location.href)) return;
+        directTries++;
+        fetchDirectToken();
+        if (!run.token && directTries < 3) setTimeout(maybeDirectToken, 15000);
+      } catch (e) {}
+    }
+    try { setTimeout(maybeDirectToken, 8000); } catch (e) {}
     function watchStream(res, url, entry) {
       run.taps++;
+      // 常驻流档案：tapLog 是滚动窗（遥测几分钟就冲掉证据），streams 只记
+      // “像流”的条目（SSE 系 CT 或 stream 系 URL），cap 25，晚导出也不丢。
+      try {
+        var sct = (entry && entry.ct) || '';
+        var su = String(url || '');
+        if (entry && run.streams.length < 25 && run.streams.indexOf(entry) < 0 &&
+            (/event-stream|x-ndjson|stream\+json/i.test(sct) || /(stream|conversation|realtime|batch)/i.test(su))) {
+          run.streams.push(entry);
+        }
+      } catch (e) {}
       emitStats(); // 让诊断区能看到“收到 N 条流”的进度，不至于以为没流量。
       // 渐进读 clone 分支找 token（token 在流开头 headers 帧，不能等流结束）。
       try {
@@ -469,16 +620,19 @@
         var buf = '', bytes = 0, done = false, fbNext = 32768;
         (function pump() {
           reader.read().then(function (r) {
-            if (r.done || done) { try { reader.cancel(); } catch (e) {} return; }
-            bytes += r.value ? r.value.length : 0;
+            if (r.done || done) { try { reader.cancel(); } catch (e) {} emitStats(); return; }
+            var n = r.value ? r.value.length : 0;
+            bytes += n;
             if (entry) { try { entry.kb = Math.round(bytes / 1024); } catch (e2) {} }
             try { buf += dec.decode(r.value || new Uint8Array(0), { stream: true }); } catch (e) {}
-            if (buf.length < 2 * 1024 * 1024) {
-              var tk = findTokenLabel(buf);
-              if (!tk && bytes >= fbNext) { fbNext += 131072; tk = findTokenByScope(buf); }
-              if (tk) { done = true; if (entry) { try { entry.tok = 1; } catch (e2) {} } acceptToken(tk); try { reader.cancel(); } catch (e) {} return; }
-            }
-            if (bytes > 512 * 1024) { try { reader.cancel(); } catch (e) {} return; }
+            try { run.searchedKB += Math.round(n / 1024); } catch (e2) {}
+            // 滑动窗口：只留尾部 128KB 供正则（token 是局部模式，JWT 几百字符），
+            // 内存有界；不再 512KB 掐流——长 run 的 token 若来得晚，以前永远见不到。
+            if (buf.length > 131072) { try { buf = buf.slice(-131072); } catch (e3) {} }
+            var tk = findTokenLabel(buf);
+            if (!tk && bytes >= fbNext) { fbNext += 131072; tk = findTokenByScope(buf); }
+            if (tk) { done = true; if (entry) { try { entry.tok = 1; } catch (e2) {} } acceptToken(tk); try { reader.cancel(); } catch (e) {} return; }
+            if (bytes > 10 * 1024 * 1024) { try { reader.cancel(); } catch (e) {} emitStats(); return; }
             pump();
           }).catch(function () {});
         })();
@@ -572,7 +726,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { hasToken: !!run.token, runId: run.runId || '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, tapLog: run.tapLog.slice(-8), reqRuns: run.reqRuns.slice() },
+              run: { hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -633,18 +787,32 @@
             try { ct = String((res.headers && res.headers.get('content-type')) || '').toLowerCase(); } catch (e2) {}
             var watchable = !STATIC_EXT_RE.test(url || '') && (STREAM_CT_RE.test(ct) || !ct || STREAM_URL_RE.test(url || ''));
             // 取证日志：每条 fetch 响应都记一笔（URL 尾/CT/旁路否），诊断包里能看到
-            // agent 那条流到底长什么样、为什么没命中 token。只留最近 12 条。
+            // agent 那条流到底长什么样、为什么没命中 token。环 300 条（遥测多，
+            // 12 条的话导出时早被冲掉）；另有 streams[] 常驻“像流”的条目防冲刷。
             var entry = null;
             try {
-              entry = { u: String(url || '').slice(-90), ct: String(ct || '').slice(0, 48), tap: watchable ? 1 : 0, kb: 0, tok: 0 };
+              entry = { t: Date.now(), u: String(url || '').slice(-90), ct: String(ct || '').slice(0, 48), tap: watchable ? 1 : 0, kb: 0, tok: 0 };
               run.tapLog.push(entry);
-              if (run.tapLog.length > 12) run.tapLog.shift();
+              if (run.tapLog.length > 300) run.tapLog.shift();
               var rrm = /run_[A-Za-z0-9]{4,}/.exec(url || '');
               if (rrm && run.reqRuns.indexOf(rrm[0]) < 0) {
                 run.reqRuns.push(rrm[0]);
                 if (run.reqRuns.length > 3) run.reqRuns.shift();
               }
             } catch (e4) {}
+            // trigger-token 专线：会话制正门的响应（{"token": JWT}）不等通用
+            // clone().text() 链——那条链只认 access-token 标签，会漏抓。
+            try {
+              if (!run.token && /trigger-token/i.test(url || '')) {
+                res.clone().text().then(function (tt) {
+                  try {
+                    if (run.token) return;
+                    var mm = TOKEN_JSON_RE.exec(tt || '');
+                    if (mm && mm[1]) acceptToken(mm[1]);
+                  } catch (e9) {}
+                }).catch(function () {});
+              }
+            } catch (e8) {}
             if (watchable) {
               try { watchStream(res, url, entry); } catch (e3) {}
             } else {
@@ -720,6 +888,10 @@
           run.fetches = 0;
           run.found = null;
           run.error = '';
+          run.searchedKB = 0;
+          run.streams = [];
+          run.sess = null;
+          if (typeof directTries !== 'undefined') { directTries = 0; try { setTimeout(maybeDirectToken, 8000); } catch (e2) {} }
           emitStats();
         } catch (e) {}
       });
