@@ -17,7 +17,7 @@
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
-    build: '20260917-hdr-carrier',
+    build: '20260918-pulse-gate',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -614,7 +614,9 @@
       directTries++;
       tokenFetching = true;
       try {
-        fetch('/api/chat/trigger-token', { credentials: 'same-origin' }).then(function (res) {
+        // trigger-token 已被 403 封路（Route not allowed）；自救也走新门
+        // /api/me/pulse（SPA 自己在用，响应 {"token": …} 会话 JWT）。
+        fetch('/api/me/pulse', { credentials: 'same-origin' }).then(function (res) {
           tokenFetching = false;
           if (!res || !res.ok) return null;
           return res.text();
@@ -680,6 +682,12 @@
             if (entry) { try { entry.kb = Math.round(bytes / 1024); } catch (e2) {} }
             try { buf += dec.decode(r.value || new Uint8Array(0), { stream: true }); } catch (e) {}
             try { run.searchedKB += Math.round(n / 1024); } catch (e2) {}
+            // 首块快照（记录结构取证）+ 流里见到的 run_ id 归档（兜底线索）。
+            try { if (entry && !entry.head && buf) { entry.head = String(buf).slice(0, 200).replace(/ey[A-Za-z0-9_\-]{6,}/g, function (x) { return 'eyJ…(' + x.length + ')'; }); } } catch (eHd) {}
+            try {
+              var rids = buf.match(/run_[A-Za-z0-9]{16,}/g);
+              if (rids) for (var ri = 0; ri < rids.length && run.reqRuns.length < 12; ri++) if (run.reqRuns.indexOf(rids[ri]) < 0) run.reqRuns.push(rids[ri]);
+            } catch (eR) {}
             // 滑动窗口：只留尾部 128KB 供正则（token 是局部模式，JWT 几百字符），
             // 内存有界；不再 512KB 掐流——长 run 的 token 若来得晚，以前永远见不到。
             if (buf.length > 131072) { try { buf = buf.slice(-131072); } catch (e3) {} }
@@ -780,7 +788,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260917-hdr-carrier', hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260918-pulse-gate', hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -835,7 +843,14 @@
     // 名字不设限（Authorization/x-*/随便）；头名记进 reqHdrs 供下次诊断定位。
     function collectReqHeaders(input, init) {
       var out = [];
-      function add(k, v) { try { out.push([String(k), String(v)]); } catch (e) {} }
+      function add(k, v) {
+        // fetch 规范允许 headers 为 [[name, value], ...] 二元数组序列——实测 SPA
+        // 的 fetch 包装器就注入这种格式（之前下标当名、值拼串，JWT 全被漏接）。
+        try {
+          if (Object.prototype.toString.call(v) === '[object Array]' && v.length === 2 && typeof v[0] === 'string' && typeof v[1] === 'string') { k = v[0]; v = v[1]; }
+          out.push([String(k), String(v)]);
+        } catch (e) {}
+      }
       function each(h) {
         try {
           if (!h) return;
@@ -867,8 +882,13 @@
           var um = /[?&](?:token|access[-_]?token|jwt)=(eyJ[\w-]+\.[\w-]+\.[\w-]+)/i.exec(su);
           if (um) { hit = um[1]; hitName = 'url-query'; }
         }
-        if (/ai-proxy|realtime|trigger-token|\/in\/append|\/out/i.test(su) || hit) {
-          run.reqHdrs.push({ t: Date.now(), u: su.slice(-60), hn: names.join(',').slice(0, 120), tok: hitName });
+        if (/ai-proxy|realtime|trigger-token|me\/pulse|\/in\/append|\/out/i.test(su) || hit) {
+          // 请求体快照（in/append 的 body 里可能有 run/model 线索），JWT 打码。
+          var bd = '';
+          try {
+            if (init && typeof init.body === 'string') bd = init.body.slice(0, 160).replace(/ey[A-Za-z0-9_\-]{6,}/g, function (x) { return 'eyJ…(' + x.length + ')'; });
+          } catch (eB) {}
+          run.reqHdrs.push({ t: Date.now(), u: su.slice(-60), hn: names.join(',').slice(0, 120), tok: hitName, bd: bd });
           if (run.reqHdrs.length > 12) run.reqHdrs.shift();
         }
         if (hit && tokenHasRunScope(hit)) acceptToken(hit);
@@ -905,7 +925,11 @@
             // trigger-token 专线：会话制正门的响应（{"token": JWT}）不等通用
             // clone().text() 链——那条链只认 access-token 标签，会漏抓。
             try {
-              if (/trigger-token/i.test(url || '')) {
+              // token 正门换地址了：trigger-token 被 403 封死（Route not
+              // allowed），新门 = /api/me/pulse——探针实锤其响应带
+              // {"token":"eyJ…"}，scopes 即本会话 UUID 的 read/write:sessions。
+              // 两条路都盯：状态码+打码正文进日志，token 一见就收。
+              if (/(trigger-token|me\/pulse)/i.test(url || '')) {
                 if (entry) { try { entry.st = (res && res.status) || 0; } catch (eS) {} }
                 res.clone().text().then(function (tt) {
                   try {
