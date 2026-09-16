@@ -12,7 +12,8 @@
     {
       "matches": ["https://arena.ai/*"],
       "js": ["ext.js", "model-utils.js", "detector.js", "models-scan.js", "badge.js", "content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_start",
+      "all_frames": true
     }
   ],
   "action": {

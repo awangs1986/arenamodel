@@ -622,7 +622,9 @@
     }
     try {
       var origFetch = window.fetch;
-      window.fetch = function (input) {
+      // 防重包（学原版 __probeWrapped）：SPA/二次注入不再叠床架屋，否则 taps 双计。
+      if (origFetch && !origFetch.__kmpWrapped) {
+      var kmpFetch = function (input) {
         var url = reqUrl(input);
         return origFetch.apply(this, arguments).then(function (res) {
           try {
@@ -665,10 +667,16 @@
           return res;
         });
       };
+      kmpFetch.__kmpWrapped = true;
+      window.fetch = kmpFetch;
+      }
     } catch (e) {}
     try {
-      var origSend = XMLHttpRequest.prototype.send;
-      XMLHttpRequest.prototype.send = function () {
+      var XHP = XMLHttpRequest.prototype;
+      // 防重包：同学原版，重复注入不再叠加监听器。
+      if (XHP && XHP.send && !XHP.send.__kmpWrapped) {
+      var origSend = XHP.send;
+      var kmpSend = function () {
         var xhr = this;
         try {
           // 流式 XHR：progress 增量里找 token，不等 load。
@@ -694,6 +702,9 @@
         } catch (e) {}
         return origSend.apply(this, arguments);
       };
+      kmpSend.__kmpWrapped = true;
+      XHP.send = kmpSend;
+      }
     } catch (e) {}
     // 内容脚本的种子 token / 切页重置经 CustomEvent 进来（页面世界单向收）。
     try {
@@ -718,26 +729,64 @@
 
   // 注入页面上下文的嗅探脚本：函数 toString 内联执行，不 fetch 自身资源（Firefox 曾因此失败）。
   // CSP 若拦截则静默降级，靠 deep 扫描兜底；5 秒没收到 ready 回报就记一笔以便区分。
+  // document_start 时 <html> 可能还没出生：MO 等它出生再注（仍远早于页面 bundle），
+  // 另加轮询兜底；注上后两边互清，避免重复注入叠钩子。
   let snoopInjected = false;
-  function ensureNetSnoop() {
-    if (snoopInjected) return;
-    snoopInjected = true;
+  function tryInjectSnoopRoot() {
     try {
+      const root = document.head || document.documentElement;
+      if (!root) return false;
       const src = '(' + snoopPayload.toString() + ')();';
       const el = document.createElement('script');
       el.textContent = src;
-      (document.head || document.documentElement).appendChild(el);
+      root.appendChild(el);
       el.remove();
       log('snoop injected, src len:', src.length);
+      return true;
+    } catch (e) {
+      diagNote(e, 'ensureNetSnoop');
+      return false;
+    }
+  }
+  function armSnoopReadyCheck() {
+    try {
       setTimeout(() => {
         if (!diag.net.ready) {
           diagNote(new Error('no snoop ready after 5s (CSP?)'), 'ensureNetSnoop');
           persistDiag();
         }
       }, 5000);
-    } catch (e) {
-      diagNote(e, 'ensureNetSnoop');
-    }
+    } catch (e) {}
+  }
+  function ensureNetSnoop() {
+    if (snoopInjected) return;
+    snoopInjected = true;
+    let finished = false;
+    let mo = null;
+    let timer = 0;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      try { if (mo) mo.disconnect(); } catch (e) {}
+      try { if (timer) clearInterval(timer); } catch (e) {}
+      armSnoopReadyCheck();
+    };
+    if (tryInjectSnoopRoot()) { done(); return; }
+    try {
+      mo = new MutationObserver(() => {
+        try { if (tryInjectSnoopRoot()) done(); } catch (e) {}
+      });
+      mo.observe(document, { childList: true, subtree: true });
+    } catch (e) {}
+    try {
+      let n = 0;
+      timer = setInterval(() => {
+        try {
+          if (tryInjectSnoopRoot()) done();
+          else if (++n > 40) { try { clearInterval(timer); } catch (e) {} timer = 0; }
+        } catch (e) {}
+      }, 50);
+    } catch (e) {}
   }
 
   // 运行轨迹结论（最高权威）：trace 报出的真实模型名直接定论。名字若不在目录里
@@ -892,6 +941,14 @@
     tick();
   }
 
+  // 抢跑：content 脚本 document_start 执行，第一时间把页面钩子装上——这是原版
+  // 宿主 document-created 注入的平替。之前 document_idle 进场时页面 bundle 早把
+  // 干净 fetch 存起来自用了，主 agent 流永远看不见（taps=12 全是边角料即明证）。
+  // iframe 里只装钩子不跑扫描：结论/徽标只归顶层，避免各 frame 互相覆盖结论。
+  let isTopFrame = true;
+  try { isTopFrame = window.top === window.self; } catch (e) { isTopFrame = false; }
+  ensureNetSnoop();
+  if (!isTopFrame) return;
   armScan();
   setInterval(() => {
     if (location.href !== lastHref) {
