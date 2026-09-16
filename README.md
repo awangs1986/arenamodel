@@ -45,6 +45,8 @@ The repo ships a real snapshot in `models.json` (1066 raw / 315 valid entries as
    **before voting the identities are genuinely unknowable** — the server never sends them to the frontend,
    so the UI honestly reports "in battle, identities hidden". After the reveal, both names are captured
    from the result text (a `MutationObserver` re-checks the DOM as streaming/voting mutates it).
+   Agent pages (`/agent/xxx`, no model switcher) are covered by scanning embedded page data
+   and API responses for known internal model ids (`page-data` / `network` sources).
 5. **Validity filter.** Only entries with a `text` / `search` / `image` output capability **and** an
    `organization` are shown — this drops internal `stealth` placeholders, matching the original `list_models`.
 6. **Name → id mapping.** The `publicName → internal id` lookup (`resolve` / `/lookup`) is exactly the
@@ -124,6 +126,8 @@ src/main.py        CLI entry point
    （精确命中优先，其次最长名字包含匹配）。匿名对战靠投票按钮判定（"A is better" / "Tie" / "Both are bad"）：
    **投票前双方身份是真的看不到**——服务器根本不下发到前端，所以界面会如实显示"对战中、身份未公开"；
    揭晓后从结果文本捕获双方名字（`MutationObserver` 在流式输出/投票改 DOM 时去抖重检）。
+   Agent 页（/agent/xxx，无模型切换器）走另外两条：扫页面脚本里的模型内部 id，或嗅探对话接口返回里的模型 id
+   （来源标为[页面数据]/[网络请求]；Python 版仅支持前者，匿名抓取加载不出 agent 对话）。
 5. **有效性过滤。** 只展示有 `text` / `search` / `image` 输出能力**且**有 `organization` 的项——
    滤掉内部 `stealth` 占位模型，与原项目 `list_models` 一致。
 6. **显示名 → 内部 id 映射。** `resolve` / `/lookup` 这一步，正是原项目调 `chat/completions` 之前找 `modelAId` 的那一步。

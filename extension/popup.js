@@ -165,7 +165,7 @@ async function loadChat() {
     box.appendChild(chatEmpty('还没有检测数据：打开一个 arena.ai 对话页，插件会自动识别。'));
     return;
   }
-  const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区' };
+  const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区', 'page-data': '页面数据', network: '网络请求' };
   if (cc.mode === 'direct' && cc.models.length) {
     modeEl.textContent = `直接对话（来源：${srcMap[cc.source] || cc.source}）`;
     for (const m of cc.models) box.appendChild(buildRow(m));

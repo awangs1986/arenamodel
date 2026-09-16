@@ -1,6 +1,7 @@
 /* 当前对话识别（由 content.js 调用）。
  * 诚实的设计边界：
- * - 直接对话：页面明确知道选了哪个模型 → 可识别（URL 参数 / 模型选择器文字）。
+ * - 直接对话：页面明确知道选了哪个模型 → 可识别（URL 参数 / 模型选择器文字 /
+ *   页面数据里的模型内部 id，agent 页就靠这一条）。
  * - 匿名对战：投票前服务器根本不下发身份，前端无从得知 → 只显示"匿名"，
  *   投票揭晓渲染进 DOM 后再自动捕获。
  * 纯逻辑：detect(url, doc, models) 不依赖扩展 API，便于测试。
@@ -134,7 +135,35 @@ var KnowModelDetector = (() => {
     return hits.slice(0, 2).map((h) => idx.byExact[h.name]);
   }
 
-  function detect(url, doc, models) {
+  var UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+
+  // agent 页等无模型选择器的页面：全页搜已知的模型内部 id（UUID 碰撞概率≈0，命中即强信号）。
+  // initialModels 本身含全部 id，所以只在没抓到列表时调用（deep 模式，见 content.js）。
+  function findKnownIds(doc, idx) {
+    let html = '';
+    try {
+      html = doc.documentElement.outerHTML || '';
+    } catch (e) {
+      return [];
+    }
+    if (!html || html.length > 8 * 1024 * 1024) return [];
+    if (html.indexOf('initialModels') !== -1) return [];
+    const found = [];
+    const seen = Object.create(null);
+    UUID_RE.lastIndex = 0;
+    let m;
+    while ((m = UUID_RE.exec(html)) !== null) {
+      const hit = idx.byId[m[0]] || idx.byId[m[0].toLowerCase()];
+      if (hit && !seen[hit.id]) {
+        seen[hit.id] = true;
+        found.push(hit);
+      }
+      if (found.length >= 2) break;
+    }
+    return found;
+  }
+
+  function detect(url, doc, models, opts) {
     const idx = buildIndex(models);
     const voteBtns = findVoteButtons(doc);
     if (voteBtns.length >= 2) {
@@ -148,6 +177,15 @@ var KnowModelDetector = (() => {
     if (fromUrl) return { mode: 'direct', revealed: false, models: [toInfo(fromUrl.model)], source: 'url' };
     const fromSel = detectFromSelector(doc, idx);
     if (fromSel) return { mode: 'direct', revealed: false, models: [toInfo(fromSel.model)], source: 'selector' };
+    if (opts && opts.deep) {
+      const idHits = findKnownIds(doc, idx);
+      if (idHits.length === 1) {
+        return { mode: 'direct', revealed: false, models: [toInfo(idHits[0])], source: 'page-data' };
+      }
+      if (idHits.length > 1) {
+        return { mode: 'battle', revealed: true, models: idHits.map((m) => toInfo(m)), source: 'page-data' };
+      }
+    }
     return { mode: 'unknown', revealed: false, models: [], source: 'none' };
   }
 

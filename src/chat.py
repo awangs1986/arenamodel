@@ -13,12 +13,13 @@ import time
 from urllib.parse import urlparse, parse_qs
 
 from .discover import ARENA_URL, fetch_page_html, parse_models_from_html
-from .store import capability_kinds, save_models
+from .store import capability_kinds, get_models, save_models
 
 CURRENT_CHAT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "current_chat.json")
 
 _VOTE_RE = re.compile(r"(is better|^tie$|both bad|投票|平局|左侧|右侧|更好|都不|不分上下)", re.IGNORECASE)
 _BUTTON_RE = re.compile(r"<(?:button|a)\b[^>]*>(.*?)</(?:button|a)>", re.IGNORECASE | re.DOTALL)
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
 _ARIA_RE = re.compile(r'aria-label="([^"]+)"', re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
@@ -61,7 +62,7 @@ def _body_text(page_html: str) -> str:
     return _clean(body.group(1) if body else (page_html or ""))
 
 
-def detect_current_chat(url: str, page_html: str, models: list) -> dict:
+def detect_current_chat(url: str, page_html: str, models: list, has_catalog: bool = False) -> dict:
     """与 detector.js 同策略：投票按钮 → URL 参数 → 选择器文字 → 未知。"""
     by_id = {m["id"]: m for m in models if m.get("id")}
     by_exact = {m["publicName"]: m for m in models if m.get("publicName")}
@@ -113,16 +114,46 @@ def detect_current_chat(url: str, page_html: str, models: list) -> dict:
     if best:
         return {"mode": "direct", "revealed": False, "models": [to_info(by_exact[best])], "source": "selector"}
 
+    # 4) 页面数据：搜已知的内部 id（agent 页等无选择器的页面；UUID 碰撞概率约等于 0）。
+    # initialModels 目录本身含全部 id，不算证据：由 has_catalog 参数 + 残留字样双重跳过。
+    if (
+        not has_catalog
+        and page_html
+        and len(page_html) <= 8 * 1024 * 1024
+        and "initialModels" not in page_html
+    ):
+        seen_ids: set = set()
+        hits = []
+        for mobj in _UUID_RE.finditer(page_html):
+            cand = mobj.group(0)
+            m = by_id.get(cand) or by_id.get(cand.lower())
+            if m is not None and m.get("id") not in seen_ids:
+                seen_ids.add(m.get("id"))
+                hits.append(m)
+                if len(hits) >= 2:
+                    break
+        if len(hits) == 1:
+            return {"mode": "direct", "revealed": False, "models": [to_info(hits[0])], "source": "page-data"}
+        if len(hits) > 1:
+            return {"mode": "battle", "revealed": True, "models": [to_info(m) for m in hits], "source": "page-data"}
+
     return {"mode": "unknown", "revealed": False, "models": [], "source": "none"}
 
 
 async def refresh_chat(url: str = ARENA_URL, headless: bool = True, save: bool = True) -> dict:
-    """抓取对话页并识别当前模型，成功时写入 models.json 与 current_chat.json。"""
+    """抓取对话页并识别当前模型，成功时写入 current_chat.json；含目录时同步更新 models.json，无目录时用缓存识别。"""
     page_html = await fetch_page_html(headless=headless)
-    models = parse_models_from_html(page_html)
-    if save:
-        save_models(models)
-    payload = detect_current_chat(url, page_html, models)
+    try:
+        models = parse_models_from_html(page_html)
+        has_catalog = True
+        if save:
+            save_models(models)
+    except ValueError:
+        # agent/对话页 HTML 里没有 initialModels(内容客户端后加载):
+        # 用缓存模型识别,并启用[页面数据]分支。
+        models = get_models()
+        has_catalog = False
+    payload = detect_current_chat(url, page_html, models, has_catalog=has_catalog)
     payload["url"] = url
     payload["updatedAt"] = int(time.time())
     if save:
