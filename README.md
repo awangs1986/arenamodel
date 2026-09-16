@@ -32,8 +32,11 @@ python -c "from camoufox.pkgman import install; install()"
 ## 用法
 
 ```bash
-# 1. 抓取一次并存入 models.json（主功能）
+# 1. 抓取一次并存入 models.json（主功能；仓库自带一份抓取快照，开箱就有数据）
 python -m src.main refresh
+
+# 1b. 检测某个对话页正在用的模型（对应插件的「当前对话」卡片）
+python -m src.main chat --url "https://arena.ai/xxxx"
 
 # 2. 查看已保存的模型
 python -m src.main list --limit 20
@@ -45,7 +48,7 @@ python -m src.main resolve "Claude Sonnet 4.5"
 # 4. 启动查询服务（每 30 分钟后台自动刷新）
 python -m src.main serve --port 8099
 # GET  http://127.0.0.1:8099/api/v1/models
-# GET  http://127.0.0.1:8099/api/v1/models/lookup?name=xxx
+# GET  http://127.0.0.1:8099/api/v1/current-chat   (上次 chat 命令的检测结果)
 # POST http://127.0.0.1:8099/api/v1/refresh
 # GET  http://127.0.0.1:8099/  (简易面板)
 ```
@@ -56,7 +59,8 @@ python -m src.main serve --port 8099
 models.json        抓取结果缓存
 src/discover.py    核心：浏览器抓取 + 正则解析（对照 LMArenaBridge.get_initial_data）
 src/store.py       models.json 读写 + 过滤（对照 get_models/save_models/list_models）
-src/server.py      FastAPI 查询服务
+src/chat.py        当前对话识别（与扩展 detector.js 同策略）+ current_chat.json
+src/server.py      FastAPI 查询服务（HTML 输出已转义）
 src/main.py        CLI 入口
 ```
 

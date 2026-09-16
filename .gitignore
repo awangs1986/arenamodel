@@ -1,4 +1,5 @@
 __pycache__/
+current_chat.json
 .venv/
 venv/
 *.egg-info/

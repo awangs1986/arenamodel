@@ -125,26 +125,23 @@ async def fetch_html_via_http() -> str:
         return r.text
 
 
+async def fetch_page_html(headless: bool = True) -> str:
+    """抓取页面 HTML：浏览器主路径失败则降级到 httpx。"""
+    try:
+        return await fetch_html_via_browser(headless=headless)
+    except Exception as browser_err:  # noqa: BLE001 - 失败则降级到 httpx
+        try:
+            return await fetch_html_via_http()
+        except Exception as http_err:  # noqa: BLE001
+            raise ValueError(f"browser failed ({browser_err}); http fallback failed ({http_err})") from http_err
+
+
 async def discover(headless: bool = True, save: bool = True) -> list:
     """抓取并解析，成功时（save=True）写入 models.json。"""
     from .store import save_models
 
-    last_err: Exception | None = None
-    # 1) 浏览器主路径
-    try:
-        html = await fetch_html_via_browser(headless=headless)
-        models = parse_models_from_html(html)
-        if save:
-            save_models(models)
-        return models
-    except Exception as e:  # noqa: BLE001 - 失败则降级到 httpx
-        last_err = e
-    # 2) httpx 兜底
-    try:
-        html = await fetch_html_via_http()
-        models = parse_models_from_html(html)
-        if save:
-            save_models(models)
-        return models
-    except Exception as e:  # noqa: BLE001
-        raise ValueError(f"browser failed ({last_err}); http fallback failed ({e})") from e
+    html = await fetch_page_html(headless=headless)
+    models = parse_models_from_html(html)
+    if save:
+        save_models(models)
+    return models

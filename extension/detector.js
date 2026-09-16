@@ -12,20 +12,13 @@ var KnowModelDetector = (() => {
     return String(s == null ? '' : s).trim();
   }
 
-  function toInfo(m, side) {
-    const oc = ((m && m.capabilities) || {}).outputCapabilities || {};
-    const caps = [];
-    if (oc.text) caps.push('文本');
-    if (oc.search) caps.push('搜索');
-    if (oc.image) caps.push('生图');
-    const info = {
+  function toInfo(m) {
+    return {
       publicName: (m && m.publicName) || '',
       organization: (m && m.organization) || '',
       id: (m && m.id) || '',
-      capabilities: caps,
+      capabilities: KnowModel.caps(m),
     };
-    if (side) info.side = side;
-    return info;
   }
 
   function buildIndex(models) {

@@ -25,19 +25,30 @@ def save_models(models: list) -> None:
     os.replace(tmp_path, MODELS_FILE)
 
 
+def _output_caps(m: dict) -> dict:
+    return ((m.get("capabilities") or {}).get("outputCapabilities") or {}) or {}
+
+
+def is_valid_model(m: dict) -> bool:
+    """有效模型：有 text/search/image 输出能力且有 organization（排除 stealth）。"""
+    oc = _output_caps(m)
+    return bool(
+        (oc.get("text") or oc.get("search") or oc.get("image"))
+        and m.get("organization")
+        and m.get("publicName")
+    )
+
+
+def capability_kinds(m: dict) -> list:
+    """返回模型具备的输出能力键（text/search/image 的子集），用于展示。"""
+    oc = _output_caps(m)
+    return [k for k in ("text", "search", "image") if oc.get(k)]
+
+
 def valid_models(models: list | None = None) -> list:
     """与原项目 list_models 相同的过滤：有 text/search/image 输出能力且有 organization（排除 stealth）。"""
     models = get_models() if models is None else models
-    return [
-        m for m in models
-        if (
-            m.get("capabilities", {}).get("outputCapabilities", {}).get("text")
-            or m.get("capabilities", {}).get("outputCapabilities", {}).get("search")
-            or m.get("capabilities", {}).get("outputCapabilities", {}).get("image")
-        )
-        and m.get("organization")
-        and m.get("publicName")
-    ]
+    return [m for m in models if is_valid_model(m)]
 
 
 def to_openai_list(models: list | None = None) -> dict:

@@ -11,18 +11,44 @@ const toastEl = $('#toast');
 
 let all = [];
 
-function capsOf(m) {
-  const oc = ((m && m.capabilities) || {}).outputCapabilities || {};
-  const out = [];
-  if (oc.text) out.push('文本');
-  if (oc.search) out.push('搜索');
-  if (oc.image) out.push('生图');
-  return out;
-}
+// 共享行构建：模型列表（原始模型）与当前对话卡片（识别结果）共用；
+// KnowModel.caps 同时兼容 capabilities 对象与中文标签数组两种形态。
+function buildRow(m) {
+  const div = document.createElement('div');
+  div.className = 'row';
+  div.title = '点击复制内部 id';
 
-function isValid(m) {
-  const oc = ((m && m.capabilities) || {}).outputCapabilities || {};
-  return Boolean((oc.text || oc.search || oc.image) && m.organization && m.publicName);
+  const name = document.createElement('div');
+  name.className = 'name';
+  name.textContent = m.publicName || '(未命名)';
+  div.appendChild(name);
+
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  if (m.organization) {
+    const org = document.createElement('span');
+    org.className = 'chip org';
+    org.textContent = m.organization;
+    meta.appendChild(org);
+  }
+  for (const c of KnowModel.caps(m)) {
+    const s = document.createElement('span');
+    s.className = 'chip';
+    s.textContent = c;
+    meta.appendChild(s);
+  }
+  div.appendChild(meta);
+
+  const id = document.createElement('div');
+  id.className = 'id';
+  id.textContent = m.id || '';
+  div.appendChild(id);
+
+  div.addEventListener('click', async () => {
+    const ok = await copyText(m.id || '');
+    toast(ok ? '已复制内部 id' : '复制失败');
+  });
+  return div;
 }
 
 function fmtTime(ts) {
@@ -70,39 +96,7 @@ function render() {
   listEl.style.display = rows.length ? '' : 'none';
   emptyEl.style.display = rows.length ? 'none' : 'block';
   for (const m of rows) {
-    const div = document.createElement('div');
-    div.className = 'row';
-    div.title = '点击复制内部 id';
-
-    const name = document.createElement('div');
-    name.className = 'name';
-    name.textContent = m.publicName || '(未命名)';
-    div.appendChild(name);
-
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    const org = document.createElement('span');
-    org.className = 'chip org';
-    org.textContent = m.organization || '';
-    meta.appendChild(org);
-    for (const c of capsOf(m)) {
-      const s = document.createElement('span');
-      s.className = 'chip';
-      s.textContent = c;
-      meta.appendChild(s);
-    }
-    div.appendChild(meta);
-
-    const id = document.createElement('div');
-    id.className = 'id';
-    id.textContent = m.id || '';
-    div.appendChild(id);
-
-    div.addEventListener('click', async () => {
-      const ok = await copyText(m.id || '');
-      toast(ok ? '已复制内部 id' : '复制失败');
-    });
-    listEl.appendChild(div);
+    listEl.appendChild(buildRow(m));
   }
 }
 
@@ -110,7 +104,7 @@ async function load() {
   const { models, updatedAt } = await ext.storage.local.get(['models', 'updatedAt']);
   const raw = Array.isArray(models) ? models : [];
   all = raw
-    .filter(isValid)
+    .filter(KnowModel.isValid)
     .sort((a, b) => String(a.publicName).localeCompare(String(b.publicName), 'zh'));
   updatedEl.textContent =
     '更新于 ' + fmtTime(updatedAt) + (raw.length && raw.length !== all.length ? `（原始 ${raw.length}，已过滤无厂商模型）` : '');
@@ -149,40 +143,6 @@ $('#open').addEventListener('click', () => {
   ext.tabs.create({ url: 'https://arena.ai/' });
 });
 
-function chatRowEl(m) {
-  const div = document.createElement('div');
-  div.className = 'row';
-  div.title = '点击复制内部 id';
-  const name = document.createElement('div');
-  name.className = 'name';
-  name.textContent = m.publicName || '(未命名)';
-  div.appendChild(name);
-  const meta = document.createElement('div');
-  meta.className = 'meta';
-  if (m.organization) {
-    const org = document.createElement('span');
-    org.className = 'chip org';
-    org.textContent = m.organization;
-    meta.appendChild(org);
-  }
-  for (const c of m.capabilities || []) {
-    const s = document.createElement('span');
-    s.className = 'chip';
-    s.textContent = c;
-    meta.appendChild(s);
-  }
-  div.appendChild(meta);
-  const id = document.createElement('div');
-  id.className = 'id';
-  id.textContent = m.id || '';
-  div.appendChild(id);
-  div.addEventListener('click', async () => {
-    const ok = await copyText(m.id || '');
-    toast(ok ? '已复制内部 id' : '复制失败');
-  });
-  return div;
-}
-
 function chatEmpty(text) {
   const d = document.createElement('div');
   d.className = 'chat-empty';
@@ -208,10 +168,10 @@ async function loadChat() {
   const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区' };
   if (cc.mode === 'direct' && cc.models.length) {
     modeEl.textContent = `直接对话（来源：${srcMap[cc.source] || cc.source}）`;
-    for (const m of cc.models) box.appendChild(chatRowEl(m));
+    for (const m of cc.models) box.appendChild(buildRow(m));
   } else if (cc.mode === 'battle' && cc.revealed && cc.models.length) {
     modeEl.textContent = '匿名对战 · 已揭晓';
-    for (const m of cc.models) box.appendChild(chatRowEl(m));
+    for (const m of cc.models) box.appendChild(buildRow(m));
   } else if (cc.mode === 'battle') {
     modeEl.textContent = '匿名对战中';
     box.appendChild(chatEmpty('投票前双方身份不公开（服务器就没下发，前端看不到）。投票揭晓后这里会自动显示双方模型。'));

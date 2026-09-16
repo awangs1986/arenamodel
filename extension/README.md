@@ -32,8 +32,9 @@
   「匿名对战中」，投票揭晓渲染进页面后自动捕获双方名字。
 - **首页 / 榜单页**：显示「没检测到对话」，去开一个对话再回来。
 
-实现：`detector.js` 纯逻辑（URL 参数 → 选择器文字 → 投票按钮判定 → 揭晓捕获），
-`content.js` 用 MutationObserver 去抖监听 DOM 变化（流式输出、投票揭晓），结果存
+实现：`detector.js` 纯逻辑（URL 参数 → 选择器文字 → 投票按钮判定 → 揭晓捕获，本体不碰扩展 API）；
+`models-scan.js` 负责列表提取正则；`badge.js` 负责右下角徽标；`model-utils.js` 收敛能力标签与有效性判定；
+`content.js` 只做编排（定时抓取 + MutationObserver 去抖重检 + popup 刷新消息），结果存
 `storage.currentChat`，弹窗从里面读。无需新增权限。
 
 ## 文件
@@ -41,8 +42,11 @@
 ```
 manifest.json   MV3 配置（仅 storage 权限 + arena.ai 主机权限）
 ext.js         命名空间兼容层（Chrome 用 chrome，Firefox 用 browser）
-detector.js     当前对话识别纯逻辑（直接/对战/揭晓/未知）
-content.js      页面内抓取 + 对话识别 + 右下角徽标 + 上报
+model-utils.js  模型小工具：能力标签 + 有效性判定（各处共用）
+detector.js     当前对话识别纯逻辑（直接/对战/揭晓/未知，不碰扩展 API）
+models-scan.js  模型列表提取（initialModels 正则，与 Python 版同源）
+badge.js        右下角徽标：文字映射 + 元素托管
+content.js      编排层：定时抓取 + DOM 去抖重检 + popup 刷新消息
 background.js   更新工具栏角标计数
 popup.html/js   弹窗界面：当前对话卡片 / 搜索 / 列表 / 点击复制 / 刷新
 ```

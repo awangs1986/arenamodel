@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import html
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
+from . import chat as chat_mod
 from . import store
 from .discover import discover
 
@@ -49,9 +51,12 @@ def lookup(name: str):
     return hit
 
 
-@app.get("/api/v1/models/raw")
-def raw():
-    return {"count": len(store.get_models()), "models": store.get_models()}
+@app.get("/api/v1/current-chat")
+def current_chat():
+    cc = chat_mod.get_current_chat()
+    if not cc:
+        raise HTTPException(status_code=404, detail="还没有检测数据：先运行 python -m src.main chat")
+    return cc
 
 
 @app.post("/api/v1/refresh")
@@ -66,9 +71,13 @@ async def refresh():
 @app.get("/", response_class=HTMLResponse)
 def index():
     models = store.valid_models()
+
+    def esc(v):
+        return html.escape(str(v or ""), quote=False)
+
     rows = "\n".join(
-        f"<tr><td>{m.get('publicName','')}</td><td>{m.get('organization','')}</td>"
-        f"<td><code>{m.get('id','')}</code></td></tr>"
+        f"<tr><td>{esc(m.get('publicName'))}</td><td>{esc(m.get('organization'))}</td>"
+        f"<td><code>{esc(m.get('id'))}</code></td></tr>"
         for m in sorted(models, key=lambda x: str(x.get("publicName")))
     ) or '<tr><td colspan="3">暂无数据，先运行 <code>python -m src.main refresh</code></td></tr>'
     return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">

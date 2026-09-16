@@ -1,4 +1,4 @@
-"""CLI 入口：refresh / list / resolve / serve。"""
+"""CLI 入口：refresh / list / resolve / chat / serve。"""
 from __future__ import annotations
 
 import argparse
@@ -34,8 +34,7 @@ def cmd_list(args) -> int:
     total = len(models)
     models = models[: args.limit]
     for m in models:
-        caps = m.get("capabilities", {}).get("outputCapabilities", {})
-        kinds = [k for k in ("text", "search", "image") if caps.get(k)]
+        kinds = store.capability_kinds(m)
         print(f"{m.get('publicName')}  [{m.get('organization')}]  ({','.join(kinds)})")
     print(f"-- 共 {total} 个（models.json 缓存，refresh 更新）")
     return 0
@@ -50,6 +49,26 @@ def cmd_resolve(args) -> int:
     print(f"id:           {hit['id']}")
     print(f"organization: {hit['organization']}")
     print(f"capabilities: {hit['capabilities']}")
+    return 0
+
+
+def cmd_chat(args) -> int:
+    from .chat import refresh_chat
+
+    try:
+        cc = asyncio.run(refresh_chat(url=args.url, headless=not args.show, save=True))
+    except Exception as e:  # noqa: BLE001
+        print(f"检测失败: {e}", file=sys.stderr)
+        return 1
+    if cc["mode"] == "direct" and cc["models"]:
+        m = cc["models"][0]
+        print(f"直接对话：{m['publicName']}  [{m['organization']}]  id={m['id']}  （来源：{cc['source']}）")
+    elif cc["mode"] == "battle" and cc["revealed"] and cc["models"]:
+        print("匿名对战 · 已揭晓：" + " vs ".join(m["publicName"] for m in cc["models"]))
+    elif cc["mode"] == "battle":
+        print("匿名对战中：投票前双方身份不公开，揭晓后重跑 chat 即可看到。")
+    else:
+        print("没检测到对话（首页 / 榜单页会这样）：换个对话 URL 再试。")
     return 0
 
 
@@ -77,6 +96,11 @@ def main(argv=None) -> int:
     pv = sub.add_parser("resolve", help="显示名 -> 内部 id")
     pv.add_argument("name")
     pv.set_defaults(func=cmd_resolve)
+
+    pc = sub.add_parser("chat", help="检测指定对话页正在用的模型")
+    pc.add_argument("--url", default="https://arena.ai/")
+    pc.add_argument("--show", action="store_true", help="显示浏览器窗口（默认无头）")
+    pc.set_defaults(func=cmd_chat)
 
     ps = sub.add_parser("serve", help="启动查询服务")
     ps.add_argument("--host", default="127.0.0.1")
