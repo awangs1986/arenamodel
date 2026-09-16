@@ -17,7 +17,7 @@
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
-    build: '20260918-pulse-gate',
+    build: '20260918-slow-poll',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -305,7 +305,7 @@
     // 会话制正门形态：{"token": "eyJ..."}（键名就是 token，无 access-token 标签）。
     var TOKEN_JSON_RE = /"(?:public-access-token|access-token|token|runToken)"\s*:\s*"(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"/;
     var REALTIME_BASE = 'https://api.trigger.dev';
-    var run = { token: null, runId: null, sess: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqHdrs: [], reqRuns: [] };
+    var run = { token: null, runId: null, sess: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqHdrs: [], reqRuns: [], accepts: [], prevSeq: -1, slowMode: false };
     // 跳过的条目不值得每次都刷诊断（storage 写太频繁）；节流到 2s 一次。
     // 旁路的流由 watchStream 即时 emit，这里只管“跳过”那一侧。
     var lastTapEmit = 0;
@@ -412,7 +412,7 @@
       run.timer = 0;
       run.polling = false;
     }
-    function acceptToken(token) {
+    function acceptToken(token, src) {
       if (!token || typeof token !== 'string') return;
       if (token === run.token) return;
       if (!JWT_SHAPE_RE.test(token)) return;
@@ -422,6 +422,12 @@
         var p = JSON.parse(b64url(String(token).split('.')[1]));
         exp = (p && p.exp) || 0;
       } catch (e) {}
+      // 来源取证：这 token 从哪扇门进来的（头/响应/SSE/ES/WS/XHR/种子/自救），
+      // 下一轮诊断不用再猜。
+      try {
+        run.accepts.push({ t: Date.now(), src: String(src || 'unknown'), rid: rid || '' });
+        if (run.accepts.length > 8) run.accepts.shift();
+      } catch (eA) {}
       // 过期 token 直接拒收：冷打开旧对话时 SSR 残留的是上一个 run 的死 token，
       // 收下只会占槽（!run.token 守卫挡掉之后的新 token）再判 token-expired 走死。
       // 无 exp 声明则放行（无法判断）。自救/自取的新 token 自然新鲜，不受影响。
@@ -543,6 +549,29 @@
       recAttempt(0).then(function (text) {
         done();
         run.error = '';
+        // 活性信号：尾部 seqNum（响应字节会被 ~186KB 截尾，seqNum 单调涨）。
+        // 记录还在长 = agent 还在干活，别掐表；慢轮状态下自动回 6s 快轮。
+        var lastSeq = -1, recCount = 0;
+        try {
+          var d0 = JSON.parse(text);
+          var rs0 = (d0 && d0.records) || [];
+          recCount = rs0.length;
+          for (var si = 0; si < rs0.length; si++) { var sn = rs0[si] && rs0[si].seqNum; if (typeof sn === 'number' && sn > lastSeq) lastSeq = sn; }
+        } catch (e0) {}
+        if (typeof run.prevSeq !== 'number') run.prevSeq = -1;
+        run.lastSeq = lastSeq; run.lastRecs = recCount;
+        if (recCount > 0 && lastSeq > run.prevSeq) {
+          run.tries = 0;
+          if (run.slowMode) {
+            run.slowMode = false;
+            run.prevSeq = lastSeq;
+            stopPoll();
+            startPoll();
+            emitStats();
+            return;
+          }
+        }
+        run.prevSeq = lastSeq;
         // 从尾往前找最后一条 turn-complete 的 public-access-token（最新一轮）。
         var lastTok = null;
         try {
@@ -574,13 +603,19 @@
         if (lastTok && rid2) {
           run.token = lastTok;
           run.runId = rid2;
+          try { run.accepts.push({ t: Date.now(), src: 'records', rid: rid2 }); if (run.accepts.length > 8) run.accepts.shift(); } catch (eA2) {}
           try { var pp = JSON.parse(b64url(String(lastTok).split('.')[1])); run.exp = (pp && pp.exp) || 0; } catch (e3) {}
           run.error = '';
           emitStats();
           pollOnce();
         } else if (run.tries >= 30) {
-          run.error = 'timeout';
+          // 空对话/超长 agent 轮都会走到这：不再死停（rescue 的 pulse 如今
+          // 不带 token，死停=永死）。降频 30s 续等，记录一动自动回快轮。
+          run.slowMode = true;
+          run.tries = 0;
+          run.error = 'waiting-run';
           stopPoll();
+          try { run.timer = setInterval(pollOnce, 30000); run.polling = true; } catch (eSp) {}
           emitStats();
           rescueToken();
         } else {
@@ -624,7 +659,7 @@
           try {
             if (!t || (!force && run.token)) return;
             var mm = TOKEN_JSON_RE.exec(t);
-            if (mm && mm[1]) acceptToken(mm[1]);
+            if (mm && mm[1]) acceptToken(mm[1], 'self');
           } catch (e) {}
         }).catch(function () { try { tokenFetching = false; } catch (e) {} });
       } catch (e) { try { tokenFetching = false; } catch (e2) {} }
@@ -693,7 +728,7 @@
             if (buf.length > 131072) { try { buf = buf.slice(-131072); } catch (e3) {} }
             var tk = findTokenLabel(buf);
             if (!tk && bytes >= fbNext) { fbNext += 131072; tk = findTokenByScope(buf); }
-            if (tk) { done = true; if (entry) { try { entry.tok = 1; } catch (e2) {} } acceptToken(tk); try { reader.cancel(); } catch (e) {} return; }
+            if (tk) { done = true; if (entry) { try { entry.tok = 1; } catch (e2) {} } acceptToken(tk, 'sse'); try { reader.cancel(); } catch (e) {} return; }
             if (bytes > 10 * 1024 * 1024) { try { reader.cancel(); } catch (e) {} emitStats(); return; }
             pump();
           }).catch(function () {});
@@ -715,7 +750,7 @@
               var d = typeof ev.data === 'string' ? ev.data : '';
               if (!run.token && d) {
                 var tk = findToken(d);
-                if (tk) acceptToken(tk);
+                if (tk) acceptToken(tk, 'es');
               }
             });
           } catch (e) {}
@@ -741,11 +776,11 @@
                 try { d = new TextDecoder().decode(ev.data); } catch (e2) { d = ''; }
               }
               if (!d && typeof Blob === 'function' && ev.data instanceof Blob) {
-                try { ev.data.text().then(function (t) { if (!run.token) { var tk2 = findToken(t); if (tk2) acceptToken(tk2); } }).catch(function () {}); return; } catch (e2) {}
+                try { ev.data.text().then(function (t) { if (!run.token) { var tk2 = findToken(t); if (tk2) acceptToken(tk2, 'ws'); } }).catch(function () {}); return; } catch (e2) {}
               }
               if (!run.token && d) {
                 var tk = findToken(d);
-                if (tk) acceptToken(tk);
+                if (tk) acceptToken(tk, 'ws');
               }
             });
           } catch (e) {}
@@ -788,7 +823,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260918-pulse-gate', hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260918-slow-poll', hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -891,7 +926,7 @@
           run.reqHdrs.push({ t: Date.now(), u: su.slice(-60), hn: names.join(',').slice(0, 120), tok: hitName, bd: bd });
           if (run.reqHdrs.length > 12) run.reqHdrs.shift();
         }
-        if (hit && tokenHasRunScope(hit)) acceptToken(hit);
+        if (hit && tokenHasRunScope(hit)) acceptToken(hit, 'hdr:' + hitName);
       } catch (e) {}
     }
     try {
@@ -940,9 +975,9 @@
                     }
                     if (run.token) return;
                     var mm = TOKEN_JSON_RE.exec(tt || '');
-                    if (mm && mm[1]) { acceptToken(mm[1]); return; }
+                    if (mm && mm[1]) { acceptToken(mm[1], 'resp:' + (/pulse/i.test(url) ? 'pulse' : 'trig')); return; }
                     var bare = String(tt || '').trim();
-                    if (/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(bare)) acceptToken(bare);
+                    if (/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(bare)) acceptToken(bare, 'resp:bare');
                   } catch (e9) {}
                 }).catch(function () {});
               }
@@ -960,7 +995,7 @@
                   check(t, url);
                   if (!run.token) {
                     var tk = findToken(t);
-                    if (tk) acceptToken(tk);
+                    if (tk) acceptToken(tk, 'fetch-data');
                   }
                 })
                 .catch(function () {});
@@ -986,7 +1021,7 @@
             try {
               if (!run.token && typeof xhr.responseText === 'string' && xhr.responseText.length < 2 * 1024 * 1024) {
                 var tk = findToken(xhr.responseText);
-                if (tk) acceptToken(tk);
+                if (tk) acceptToken(tk, 'xhr');
               }
             } catch (e) {}
           });
@@ -996,7 +1031,7 @@
                 check(xhr.responseText, xhr.responseURL);
                 if (!run.token) {
                   var tk = findToken(xhr.responseText);
-                  if (tk) acceptToken(tk);
+                  if (tk) acceptToken(tk, 'xhr');
                 }
               }
             } catch (e) {}
@@ -1011,7 +1046,7 @@
     // 内容脚本的种子 token / 切页重置经 CustomEvent 进来（页面世界单向收）。
     try {
       window.addEventListener('knowmodel-run-token-seed', function (ev) {
-        try { acceptToken(ev && ev.detail && ev.detail.token); } catch (e) {}
+        try { acceptToken(ev && ev.detail && ev.detail.token, 'seed'); } catch (e) {}
       });
       window.addEventListener('knowmodel-nav-reset', function () {
         try {
