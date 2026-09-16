@@ -182,3 +182,75 @@ async function loadChat() {
 }
 
 load();
+
+/* TEMP-DIAG：临时诊断区逻辑，定位后连同 popup.html 里的 diagCard 一起删除。 */
+async function loadDiag() {
+  const linesEl = $('#diagLines');
+  const msgEl = $('#diagMsg');
+  let diag = null;
+  let cc = null;
+  let modelsCached = 0;
+  try {
+    const r = await ext.storage.local.get(['knowmodelDiag', 'currentChat', 'models', 'knowmodelVerbose']);
+    diag = r.knowmodelDiag || null;
+    cc = r.currentChat || null;
+    modelsCached = Array.isArray(r.models) ? r.models.length : 0;
+    $('#toggleVerbose').textContent = r.knowmodelVerbose ? '日志：开' : '日志：关';
+  } catch (e) {
+    if (linesEl) linesEl.textContent = '读取失败：' + e.message;
+    return;
+  }
+  if (!diag) {
+    if (linesEl) linesEl.textContent = '暂无诊断快照：打开一个 arena.ai 页面等几秒再开弹窗。';
+    return;
+  }
+  const evs = diag.events || [];
+  const last = evs[evs.length - 1] || {};
+  const st = (last && last.stats) || {};
+  const rows = [
+    '页面：' + (diag.url || ''),
+    '缓存模型：' + modelsCached + '　结论：' + ((cc && cc.mode + '/' + cc.source) || '无'),
+    '扫描轮次：' + evs.length +
+      '　最近：' + (last.mode || '-') + '/' + (last.source || '-') +
+      '　列表：' + (last.listFound ? '有' : '无'),
+    '页面HTML：' + (st.htmlLen || 0) + ' 字节　目录：' + (st.hasCatalog ? '有' : '无') +
+      '　uuid：' + (st.uuidScanned || 0) + ' 个　命中：' + ((st.idHits || []).join(', ') || '无'),
+    '按钮：' + (st.btnCount || 0) + ' 个　嗅探：' +
+      (diag.net.ready ? ('存活，响应 ' + diag.net.responses + '，命中 ' + diag.net.hits) : '未注入/被CSP拦截'),
+  ];
+  if (linesEl) linesEl.textContent = rows.join('\n');
+  if (msgEl && diag.errors && diag.errors.length) {
+    msgEl.textContent = '异常(' + diag.errors.length + ')：' +
+      diag.errors.slice(-3).map((e) => e.where + ':' + e.msg).join(' | ');
+  }
+}
+
+$('#copyDiag').addEventListener('click', async () => {
+  try {
+    const r = await ext.storage.local.get(['knowmodelDiag', 'currentChat', 'models']);
+    const pack = {
+      exportedAt: new Date().toISOString(),
+      modelsCached: Array.isArray(r.models) ? r.models.length : 0,
+      currentChat: r.currentChat || null,
+      diag: r.knowmodelDiag || null,
+    };
+    const ok = await copyText(JSON.stringify(pack, null, 1));
+    toast(ok ? '诊断信息已复制，发给开发者即可' : '复制失败');
+  } catch (e) {
+    toast('复制失败：' + e.message);
+  }
+});
+
+$('#toggleVerbose').addEventListener('click', async () => {
+  try {
+    const r = await ext.storage.local.get(['knowmodelVerbose']);
+    const next = !(r && r.knowmodelVerbose);
+    await ext.storage.local.set({ knowmodelVerbose: next });
+    $('#toggleVerbose').textContent = next ? '日志：开' : '日志：关';
+    toast(next ? '详细日志已开：按F12在页面控制台看 [knowmodel]' : '详细日志已关');
+  } catch (e) {
+    toast('切换失败：' + e.message);
+  }
+});
+
+loadDiag();

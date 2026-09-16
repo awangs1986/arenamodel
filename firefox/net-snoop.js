@@ -1,9 +1,10 @@
 /* 网络嗅探（页面上下文载荷，由 content.js 以 <script> 注入执行）。
  * 不能用扩展 API，只能读写 DOM。做法：hook window.fetch 与 XHR，
  * 把 JSON 响应当 UUID  token 扫描，只把命中的已知模型 id 经 CustomEvent 传出去——
- * 对话正文不出页面上下文。已知 id 列表由 content 脚本经
+ * 对话正文不出页面上下文。已知 id 列表由内容脚本经
  * documentElement 的 data-knowmodel-ids 属性传入（存模型后更新）。
  * CSP 若拦截 inline 脚本注入，本文件根本跑不起来，属预期降级（还有页面数据扫描兜底）。
+ * TEMP-DIAG：计数与状态上报（knowmodel-snoop-stats），定位后可删。
  */
 (() => {
   'use strict';
@@ -13,6 +14,10 @@
 
   var ids = new Set();
   var seen = new Set();
+  var scanned = 0;
+  var hitCount = 0;
+  var lastHitAt = 0;
+  var lastIds = [];
 
   function loadIds() {
     try {
@@ -37,9 +42,30 @@
     /* 观察不到就只用初值 */
   }
 
+  function emitStats() {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('knowmodel-snoop-stats', {
+          detail: {
+            ready: true,
+            idCount: ids.size,
+            responses: scanned,
+            hits: hitCount,
+            lastHitAt: lastHitAt,
+            lastIds: lastIds.slice(0, 4),
+          },
+        })
+      );
+    } catch (e) {
+      /* 发不出去就算了 */
+    }
+  }
+
   function check(text) {
     if (!ids.size || !text || typeof text !== 'string') return;
     if (text.length > 4 * 1024 * 1024) return;
+    scanned++;
+    if (scanned % 25 === 0) emitStats();
     var hit = [];
     UUID_RE.lastIndex = 0;
     var m;
@@ -52,7 +78,11 @@
       if (hit.length >= 4) break;
     }
     if (hit.length) {
+      hitCount += hit.length;
+      lastHitAt = Date.now();
+      lastIds = hit;
       window.dispatchEvent(new CustomEvent('knowmodel-net-hit', { detail: { ids: hit } }));
+      emitStats();
     }
   }
 
@@ -107,9 +137,5 @@
     /* hook 不上就地降级 */
   }
 
-  try {
-    window.dispatchEvent(new CustomEvent('knowmodel-snoop-ready'));
-  } catch (e) {
-    /* 忽略 */
-  }
+  emitStats();
 })();

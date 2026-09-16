@@ -3,12 +3,49 @@
  * deep 模式追加"页面数据里的模型 id"扫描）、KnowModelBadge（右下角徽标）、
  * KnowModel（模型小工具）、net-snoop.js（页面上下文网络嗅探）；本文件只做编排：
  * 定时抓取、DOM 变化去抖重检、网络命中合并、popup 刷新消息。
+ * TEMP-DIAG：诊断快照 knowmodelDiag（定位 agent 页识别问题用，修好后删除）。
  */
 'use strict';
 
 (() => {
   // 本页抓到过 initialModels（首页/榜单）时，网络命中的 id 只是列表噪音，直接忽略。
   let listFoundOnPage = false;
+
+  // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
+  let diag = {
+    url: location.href,
+    title: document.title || '',
+    verbose: false,
+    events: [],
+    net: { ready: false, idCount: 0, responses: 0, hits: 0, lastHitAt: 0, lastIds: [] },
+    errors: [],
+  };
+
+  function log() {
+    if (!diag.verbose) return;
+    try {
+      console.log.apply(console, ['[knowmodel]'].concat(Array.prototype.slice.call(arguments)));
+    } catch (e) {
+      /* 控制台不可用时跳过 */
+    }
+  }
+
+  function diagNote(err, where) {
+    try {
+      diag.errors.push({ t: Date.now(), where: where, msg: String((err && err.message) || err).slice(0, 160) });
+      if (diag.errors.length > 10) diag.errors.shift();
+    } catch (e) {
+      /* 记账失败不影响主流程 */
+    }
+  }
+
+  async function persistDiag() {
+    try {
+      await ext.storage.local.set({ knowmodelDiag: diag });
+    } catch (e) {
+      /* 存不下就算了 */
+    }
+  }
 
   async function getStoredModels() {
     try {
@@ -27,8 +64,9 @@
     try {
       const ids = (list || []).map((m) => m && m.id).filter(Boolean);
       document.documentElement.setAttribute('data-knowmodel-ids', JSON.stringify(ids));
+      log('publish ids:', ids.length);
     } catch (e) {
-      /* DOM 不可用时跳过 */
+      diagNote(e, 'publishModelIds');
     }
   }
 
@@ -86,10 +124,21 @@
       }
       await ext.storage.local.set({ currentChat: payload });
       KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
+      log('detect', deep ? 'deep' : 'light', payload.mode, payload.source);
       return payload;
     } catch (e) {
+      diagNote(e, 'updateCurrentChat');
       return null;
     }
+  }
+
+  function pageStats(models) {
+    try {
+      if (KnowModelDetector.stats) return KnowModelDetector.stats(document, models);
+    } catch (e) {
+      diagNote(e, 'pageStats');
+    }
+    return null;
   }
 
   // 网络嗅探命中（net-snoop.js 经 CustomEvent 传出）：只合并新 id，不重写已有结论。
@@ -98,6 +147,7 @@
       if (listFoundOnPage) return;
       const ids = (ev && ev.detail && ev.detail.ids) || [];
       if (!ids.length) return;
+      log('net hit:', JSON.stringify(ids));
       const models = await getStoredModels();
       const byId = Object.create(null);
       for (const m of models) {
@@ -137,7 +187,26 @@
       await ext.storage.local.set({ currentChat: payload });
       KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
     } catch (e) {
-      /* 合并失败不影响页面 */
+      diagNote(e, 'onNetHit');
+    }
+  }
+
+  // TEMP-DIAG：嗅探器状态上报（存活/扫了多少响应/命中几次）。
+  function onSnoopStats(ev) {
+    try {
+      const d = (ev && ev.detail) || {};
+      diag.net = {
+        ready: true,
+        idCount: d.idCount || 0,
+        responses: d.responses || 0,
+        hits: d.hits || 0,
+        lastHitAt: d.lastHitAt || 0,
+        lastIds: d.lastIds || [],
+      };
+      log('snoop stats:', JSON.stringify(diag.net));
+      persistDiag();
+    } catch (e) {
+      diagNote(e, 'onSnoopStats');
     }
   }
 
@@ -149,20 +218,38 @@
     snoopInjected = true;
     try {
       const src = await (await fetch(ext.runtime.getURL('net-snoop.js'))).text();
-      if (!src) return;
+      if (!src) {
+        diagNote(new Error('empty snoop source'), 'ensureNetSnoop');
+        return;
+      }
       const el = document.createElement('script');
       el.textContent = src;
       (document.head || document.documentElement).appendChild(el);
       el.remove();
+      log('snoop injected, src len:', src.length);
     } catch (e) {
-      /* 注不进去就算了 */
+      diagNote(e, 'ensureNetSnoop');
     }
   }
 
   try {
     window.addEventListener('knowmodel-net-hit', onNetHit);
+    window.addEventListener('knowmodel-snoop-stats', onSnoopStats);
   } catch (e) {
     /* 极端环境跳过 */
+  }
+
+  try {
+    ext.storage.local.get(['knowmodelVerbose']).then((r) => {
+      diag.verbose = !!(r && r.knowmodelVerbose);
+    });
+    ext.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes && changes.knowmodelVerbose) {
+        diag.verbose = !!changes.knowmodelVerbose.newValue;
+      }
+    });
+  } catch (e) {
+    /* 读不到开关就保持关闭 */
   }
 
   async function fullScan() {
@@ -173,11 +260,28 @@
     }
     ensureNetSnoop();
     const chat = await updateCurrentChat(!models || !models.length);
+    // TEMP-DIAG：记一笔 pipeline 快照
+    try {
+      diag.url = location.href;
+      diag.title = document.title || '';
+      diag.events.push({
+        t: Date.now(),
+        listFound: !!(models && models.length),
+        mode: chat && chat.mode,
+        source: chat && chat.source,
+        modelNames: ((chat && chat.models) || []).map((m) => m.publicName),
+        stats: pageStats(models && models.length ? models : await getStoredModels()),
+      });
+      if (diag.events.length > 20) diag.events.shift();
+      await persistDiag();
+    } catch (e) {
+      diagNote(e, 'fullScan-diag');
+    }
     return { models: models, chat: chat };
   }
 
   // 页面是 hydration 渐进渲染的：加载后轮询几次，直到抓到模型列表为止。
-  // SPA 切路由不重载文档：地址变化监听器会重置状态并重新拉起扫描（之前定时器停后不再醒是 bug，已改）。
+  // SPA 切路由不重载文档：地址变化监听器会重置状态并重新拉起扫描。
   let tries = 0;
   let lastHref = location.href;
   let scanTimer = null;
@@ -203,6 +307,7 @@
       lastHref = location.href;
       listFoundOnPage = false;
       tries = 0;
+      diag.events.push({ t: Date.now(), nav: lastHref });
       armScan();
     }
   }, 2000);

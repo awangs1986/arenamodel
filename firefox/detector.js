@@ -139,28 +139,75 @@ var KnowModelDetector = (() => {
 
   // agent 页等无模型选择器的页面：全页搜已知的模型内部 id（UUID 碰撞概率≈0，命中即强信号）。
   // initialModels 本身含全部 id，所以只在没抓到列表时调用（deep 模式，见 content.js）。
-  function findKnownIds(doc, idx) {
+  // TEMP-DIAG：同步收集 uuid 样本与计数，供诊断包定位用，定位后可删 sample 字段。
+  function scanPageIds(doc, idx) {
+    const st = { found: [], scanned: 0, htmlLen: 0, hasCatalog: false, sample: [] };
     let html = '';
     try {
       html = doc.documentElement.outerHTML || '';
     } catch (e) {
-      return [];
+      return st;
     }
-    if (!html || html.length > 8 * 1024 * 1024) return [];
-    if (html.indexOf('initialModels') !== -1) return [];
-    const found = [];
+    st.htmlLen = html.length;
+    st.hasCatalog = html.indexOf('initialModels') !== -1;
+    if (!html || html.length > 8 * 1024 * 1024 || st.hasCatalog) return st;
     const seen = Object.create(null);
+    const seenTok = Object.create(null);
     UUID_RE.lastIndex = 0;
     let m;
     while ((m = UUID_RE.exec(html)) !== null) {
-      const hit = idx.byId[m[0]] || idx.byId[m[0].toLowerCase()];
+      st.scanned++;
+      const tok = m[0].toLowerCase();
+      if (!seenTok[tok] && st.sample.length < 30) {
+        seenTok[tok] = true;
+        st.sample.push(tok);
+      }
+      const hit = idx.byId[m[0]] || idx.byId[tok];
       if (hit && !seen[hit.id]) {
         seen[hit.id] = true;
-        found.push(hit);
+        st.found.push(hit);
       }
-      if (found.length >= 2) break;
+      if (st.found.length >= 2 && st.sample.length >= 30) break;
     }
-    return found;
+    return st;
+  }
+
+  function findKnownIds(doc, idx) {
+    return scanPageIds(doc, idx).found;
+  }
+
+  // TEMP-DIAG：诊断快照（控件文字 + uuid 统计，不读聊天正文），定位后可删。
+  function stats(doc, models) {
+    const idx = buildIndex(models);
+    const scan = scanPageIds(doc, idx);
+    const btns = allButtons(doc);
+    const btnTexts = [];
+    const ariaLabels = [];
+    const seenAria = Object.create(null);
+    for (const el of btns) {
+      const t = textOf(el).slice(0, 60);
+      if (t && btnTexts.length < 30) btnTexts.push(t);
+      try {
+        const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+        if (a && !seenAria[a] && ariaLabels.length < 30) {
+          seenAria[a] = true;
+          ariaLabels.push(a.slice(0, 60));
+        }
+      } catch (e) {
+        /* 忽略单个控件异常 */
+      }
+      if (btnTexts.length >= 30 && ariaLabels.length >= 30) break;
+    }
+    return {
+      htmlLen: scan.htmlLen,
+      hasCatalog: scan.hasCatalog,
+      uuidScanned: scan.scanned,
+      uuidSample: scan.sample,
+      idHits: scan.found.map((m) => (m && m.publicName) || ''),
+      btnCount: btns.length,
+      btnTexts: btnTexts,
+      ariaLabels: ariaLabels,
+    };
   }
 
   function detect(url, doc, models, opts) {
@@ -189,5 +236,5 @@ var KnowModelDetector = (() => {
     return { mode: 'unknown', revealed: false, models: [], source: 'none' };
   }
 
-  return { detect: detect };
+  return { detect: detect, stats: stats };
 })();

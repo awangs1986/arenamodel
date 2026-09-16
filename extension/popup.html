@@ -49,6 +49,17 @@
     <button id="refresh">刷新</button>
     <button id="open">打开 arena.ai</button>
   </div>
+  <!-- TEMP-DIAG：临时诊断区，定位后删除 -->
+  <div id="diagCard" style="border:1px dashed #c99; border-radius:6px; padding:8px 9px; margin-top:8px;">
+    <div style="font-weight:700; margin-bottom:2px;">诊断（临时，定位后删除）</div>
+    <div class="chat-empty">只收集控件文字与 opaque id，不含聊天正文。</div>
+    <div id="diagLines" class="chat-empty" style="margin-top:4px; white-space:pre-line;">读取中…</div>
+    <div class="btns" style="margin-top:6px;">
+      <button id="copyDiag">复制诊断信息</button>
+      <button id="toggleVerbose">日志：关</button>
+    </div>
+    <div id="diagMsg" class="chat-empty"></div>
+  </div>
   <div id="toast"></div>
   <script src="ext.js"></script>
   <script src="model-utils.js"></script>
