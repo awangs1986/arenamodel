@@ -289,14 +289,16 @@
      * Trigger.dev 上该 run 的 trace：ai.streamText.doStream span 里 icon 含
      * cube 的标签就是 worker 写入的真实模型名。全程只传 token/runId/模型名。 */
     var TRIGGER_API = 'https://api.trigger.dev';
-    // 原版是 /access-token/i.test(headerName) —— 任何含 access-token 的头名都收，
-    // 不写死 public- 前缀（站点改名不至于失效）。shape 校验同原版
-    // /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/。
+    // 原版拦截器装了四路钩子：fetch / XHR / WebSocket / EventSource（installSocketHook）。
+    // 我第一版只装了 fetch/XHR——agent 流若走 ES/WS 就全军覆没（实测 diag 就是
+    // responses:0 且页面在跑）。现在补齐，并且 fetch 的门槛也按原版改成：
+    // 流式 content-type 或无 content-type 就旁路，不再只认 URL。
     var JWT_SHAPE_RE = /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/;
     var TOKEN_RE = /([A-Za-z0-9_.-]*access-token[A-Za-z0-9_.-]*)[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)/i;
     var STREAM_URL_RE = /(stream|conversation|agent|chat|run|events|realtime|batch|\/api\/)/i;
     var STATIC_EXT_RE = /\.(?:js|css|png|jpe?g|gif|svg|woff2?|ttf|ico|map|mp4|webp|avif)(?:\?|$)/i;
-    var run = { token: null, runId: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0 };
+    var STREAM_CT_RE = /text\/event-stream|application\/x-ndjson|application\/stream\+json|text\/plain/i;
+    var run = { token: null, runId: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0 };
     function b64url(s) {
       try {
         s = String(s).replace(/-/g, '+').replace(/_/g, '/');
@@ -417,6 +419,8 @@
       });
     }
     function watchStream(res, url) {
+      run.taps++;
+      emitStats(); // 让诊断区能看到“收到 N 条流”的进度，不至于以为没流量。
       // 渐进读 clone 分支找 token（token 在流开头 headers 帧，不能等流结束）。
       try {
         var reader = res.clone().body.getReader();
@@ -437,6 +441,56 @@
         })();
       } catch (e) {}
     }
+    // 补全原版 installSocketHook：EventSource / WebSocket 逐条消息里找 token。
+    // （fetch 钩子罩不到 ES/WS；实测 agent 页若不发 fetch 流，原版靠这两路兜底。）
+    try {
+      if (window.EventSource && !window.EventSource.__kmpWrapped) {
+        var OE = window.EventSource;
+        var E = function (url, cfg) {
+          var es = new OE(url, cfg);
+          try {
+            es.addEventListener('message', function (ev) {
+              run.sockMsgs++;
+              // 消息频率可能高：每 10 条或拿到 token 时才刷一次统计。
+              if (run.sockMsgs % 10 === 0 || !run.token) emitStats();
+              var d = typeof ev.data === 'string' ? ev.data : '';
+              if (!run.token && d) {
+                var tk = findToken(d);
+                if (tk) acceptToken(tk);
+              }
+            });
+          } catch (e) {}
+          return es;
+        };
+        E.prototype = OE.prototype;
+        E.__kmpWrapped = true;
+        window.EventSource = E;
+      }
+    } catch (e) {}
+    try {
+      if (window.WebSocket && !window.WebSocket.__kmpWrapped) {
+        var OW = window.WebSocket;
+        var W = function (url, protocols) {
+          var ws = new OW(url, protocols);
+          try {
+            ws.addEventListener('message', function (ev) {
+              run.sockMsgs++;
+              // 消息频率可能高：每 10 条或拿到 token 时才刷一次统计。
+              if (run.sockMsgs % 10 === 0 || !run.token) emitStats();
+              var d = typeof ev.data === 'string' ? ev.data : '';
+              if (!run.token && d) {
+                var tk = findToken(d);
+                if (tk) acceptToken(tk);
+              }
+            });
+          } catch (e) {}
+          return ws;
+        };
+        W.prototype = OW.prototype;
+        W.__kmpWrapped = true;
+        window.WebSocket = W;
+      }
+    } catch (e) {}
     function loadIds() {
       try {
         var raw = document.documentElement.getAttribute(ATTR);
@@ -469,7 +523,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { hasToken: !!run.token, runId: run.runId || '', fetches: run.fetches, found: run.found || '', error: run.error || '' },
+              run: { hasToken: !!run.token, runId: run.runId || '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs },
             },
           })
         );
@@ -523,9 +577,12 @@
         var url = reqUrl(input);
         return origFetch.apply(this, arguments).then(function (res) {
           try {
-            // token 在流开头：渐进读 clone 分支抢先捕获（不等流结束）。
-            if (!STATIC_EXT_RE.test(url || '') && STREAM_URL_RE.test(url || '')) {
-              try { watchStream(res, url); } catch (e) {}
+            // 门槛学原版 shouldInspect：流式 CT / 无 CT / LLM 风格 URL 都旁路。
+            var ct = '';
+            try { ct = String((res.headers && res.headers.get('content-type')) || '').toLowerCase(); } catch (e2) {}
+            var watchable = !STATIC_EXT_RE.test(url || '') && (STREAM_CT_RE.test(ct) || !ct || STREAM_URL_RE.test(url || ''));
+            if (watchable) {
+              try { watchStream(res, url); } catch (e3) {}
             }
             if (looksLikeData(res)) {
               res
