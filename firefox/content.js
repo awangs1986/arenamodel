@@ -297,8 +297,20 @@
     var TOKEN_RE = /([A-Za-z0-9_.-]*access-token[A-Za-z0-9_.-]*)[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)/i;
     var STREAM_URL_RE = /(stream|conversation|agent|chat|run|events|realtime|batch|\/api\/)/i;
     var STATIC_EXT_RE = /\.(?:js|css|png|jpe?g|gif|svg|woff2?|ttf|ico|map|mp4|webp|avif)(?:\?|$)/i;
-    var STREAM_CT_RE = /text\/event-stream|application\/x-ndjson|application\/stream\+json|text\/plain/i;
-    var run = { token: null, runId: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0 };
+    var STREAM_CT_RE = /text\/event-stream|application\/x-ndjson|application\/stream\+json|text\/plain|application\/json|application\/octet-stream/i;
+    // JWT 形态兜底：token 若换了个键名（如 runToken/token），TOKEN_RE 的
+    // access-token 标签就抓瞎。兜底按形态找 JWT 再验 scope（read:runs:run_）。
+    var JWT_ANY_RE = /eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]+/g;
+    var run = { token: null, runId: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, tapLog: [], reqRuns: [] };
+    // 跳过的条目不值得每次都刷诊断（storage 写太频繁）；节流到 2s 一次。
+    // 旁路的流由 watchStream 即时 emit，这里只管“跳过”那一侧。
+    var lastTapEmit = 0;
+    function emitTapStats() {
+      try {
+        var now = Date.now();
+        if (now - lastTapEmit > 2000) { lastTapEmit = now; emitStats(); }
+      } catch (e) {}
+    }
     function b64url(s) {
       try {
         s = String(s).replace(/-/g, '+').replace(/_/g, '/');
@@ -335,8 +347,37 @@
     function findToken(text) {
       try {
         var m = TOKEN_RE.exec(text || '');
+        if (m) return m[2];
+      } catch (e) {}
+      return findTokenByScope(text);
+    }
+    // 热路径（流式分片）只用标签版，避免每片全量扫形态；阈值处再调全量版。
+    function findTokenLabel(text) {
+      try {
+        var m = TOKEN_RE.exec(text || '');
         return m ? m[2] : null;
       } catch (e) { return null; }
+    }
+    function tokenHasRunScope(token) {
+      try {
+        var p = JSON.parse(b64url(String(token).split('.')[1]));
+        var scopes = (p && p.scopes) || [];
+        for (var i = 0; i < scopes.length; i++) {
+          if (/read:runs:run_/.test(String(scopes[i]))) return true;
+        }
+      } catch (e) {}
+      return false;
+    }
+    function findTokenByScope(text) {
+      try {
+        JWT_ANY_RE.lastIndex = 0;
+        var n = 0, m;
+        while ((m = JWT_ANY_RE.exec(text || '')) !== null) {
+          if (++n > 6) break;
+          if (JWT_SHAPE_RE.test(m[0]) && tokenHasRunScope(m[0])) return m[0];
+        }
+      } catch (e) {}
+      return null;
     }
     function stopPoll() {
       try { if (run.timer && typeof clearInterval === 'function') clearInterval(run.timer); } catch (e) {}
@@ -418,22 +459,24 @@
         emitStats();
       });
     }
-    function watchStream(res, url) {
+    function watchStream(res, url, entry) {
       run.taps++;
       emitStats(); // 让诊断区能看到“收到 N 条流”的进度，不至于以为没流量。
       // 渐进读 clone 分支找 token（token 在流开头 headers 帧，不能等流结束）。
       try {
         var reader = res.clone().body.getReader();
         var dec = new TextDecoder();
-        var buf = '', bytes = 0, done = false;
+        var buf = '', bytes = 0, done = false, fbNext = 32768;
         (function pump() {
           reader.read().then(function (r) {
             if (r.done || done) { try { reader.cancel(); } catch (e) {} return; }
             bytes += r.value ? r.value.length : 0;
+            if (entry) { try { entry.kb = Math.round(bytes / 1024); } catch (e2) {} }
             try { buf += dec.decode(r.value || new Uint8Array(0), { stream: true }); } catch (e) {}
             if (buf.length < 2 * 1024 * 1024) {
-              var tk = findToken(buf);
-              if (tk) { done = true; acceptToken(tk); try { reader.cancel(); } catch (e) {} return; }
+              var tk = findTokenLabel(buf);
+              if (!tk && bytes >= fbNext) { fbNext += 131072; tk = findTokenByScope(buf); }
+              if (tk) { done = true; if (entry) { try { entry.tok = 1; } catch (e2) {} } acceptToken(tk); try { reader.cancel(); } catch (e) {} return; }
             }
             if (bytes > 512 * 1024) { try { reader.cancel(); } catch (e) {} return; }
             pump();
@@ -529,7 +572,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { hasToken: !!run.token, runId: run.runId || '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs },
+              run: { hasToken: !!run.token, runId: run.runId || '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, tapLog: run.tapLog.slice(-8), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -587,8 +630,23 @@
             var ct = '';
             try { ct = String((res.headers && res.headers.get('content-type')) || '').toLowerCase(); } catch (e2) {}
             var watchable = !STATIC_EXT_RE.test(url || '') && (STREAM_CT_RE.test(ct) || !ct || STREAM_URL_RE.test(url || ''));
+            // 取证日志：每条 fetch 响应都记一笔（URL 尾/CT/旁路否），诊断包里能看到
+            // agent 那条流到底长什么样、为什么没命中 token。只留最近 12 条。
+            var entry = null;
+            try {
+              entry = { u: String(url || '').slice(-90), ct: String(ct || '').slice(0, 48), tap: watchable ? 1 : 0, kb: 0, tok: 0 };
+              run.tapLog.push(entry);
+              if (run.tapLog.length > 12) run.tapLog.shift();
+              var rrm = /run_[A-Za-z0-9]{4,}/.exec(url || '');
+              if (rrm && run.reqRuns.indexOf(rrm[0]) < 0) {
+                run.reqRuns.push(rrm[0]);
+                if (run.reqRuns.length > 3) run.reqRuns.shift();
+              }
+            } catch (e4) {}
             if (watchable) {
-              try { watchStream(res, url); } catch (e3) {}
+              try { watchStream(res, url, entry); } catch (e3) {}
+            } else {
+              emitTapStats();
             }
             if (looksLikeData(res)) {
               res

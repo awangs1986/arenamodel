@@ -219,7 +219,15 @@ async function loadDiag() {
       (diag.net.ready ? ('存活，响应 ' + diag.net.responses + '，命中 ' + diag.net.hits) : '未注入/被CSP拦截'),
     '轨迹：' + (function () {
       const r = (diag.net && diag.net.run) || null;
-      if (!r || !r.hasToken) return '无 token（发一句话后再看）· 流 ' + (r ? r.taps || 0 : 0) + ' · 消息 ' + (r ? r.sockMsgs || 0 : 0);
+      if (!r || !r.hasToken) {
+        let s = '无 token（发一句话后再看）· 流 ' + (r ? r.taps || 0 : 0) + ' · 消息 ' + (r ? r.sockMsgs || 0 : 0);
+        if (r && r.reqRuns && r.reqRuns.length) s += ' · 请求见runId：' + r.reqRuns.join(',');
+        const log = (r && r.tapLog) || [];
+        for (const e of log.slice(-4)) {
+          s += '\n　流 ' + (e.tap ? '旁路' : '跳过') + ' ' + (e.kb || 0) + 'KB' + (e.tok ? ' 命中!' : '') + ' | ' + (e.ct || '无CT') + ' | ' + (e.u || '');
+        }
+        return s;
+      }
       if (r.found) return '已解析：' + r.found;
       if (r.error) return '轮询中（' + r.fetches + ' 次），最近：' + r.error;
       return '轮询中（' + r.fetches + ' 次），runId=' + (r.runId || '?');
