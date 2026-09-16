@@ -36,7 +36,7 @@
 
 实现：`detector.js` 纯逻辑（投票按钮判定 → URL 参数 → 选择器文字 → 页面数据里的模型 id，本体不碰扩展 API）；
 `models-scan.js` 负责列表提取正则；`badge.js` 负责右下角徽标；`model-utils.js` 收敛能力标签与有效性判定；
-`net-snoop.js` 以内联脚本注入页面上下文，hook fetch/XHR，只把命中的已知模型 id 传出来（对话正文不出页面）；
+嗅探载荷内联在 `content.js`（函数 toString 注入页面上下文），hook fetch/XHR，只把命中的已知模型 id 传出来（对话正文不出页面）；
 `content.js` 只做编排（定时抓取 + DOM 去抖重检 + 网络命中合并 + popup 刷新消息；同一 URL 下不降级覆盖已有结论），结果存
 `storage.currentChat`，弹窗从里面读。无需新增权限。
 
@@ -49,8 +49,7 @@ model-utils.js  模型小工具：能力标签 + 有效性判定（各处共用�
 detector.js     当前对话识别纯逻辑（直接/对战/揭晓/未知，不碰扩展 API）
 models-scan.js  模型列表提取（initialModels 正则，与 Python 版同源）
 badge.js        右下角徽标：文字映射 + 元素托管
-net-snoop.js    页面上下文网络嗅探（fetch/XHR hook，只上报命中的模型 id）
-content.js      编排层：定时抓取 + DOM 去抖重检 + 网络命中合并 + popup 刷新消息
+content.js      编排层：目录自救 + 定时抓取 + DOM 去抖重检 + 网络命中合并 + popup 刷新消息（含内联嗅探载荷）
 background.js   更新工具栏角标计数
 popup.html/js   弹窗界面：当前对话卡片 / 搜索 / 列表 / 点击复制 / 刷新
 ```

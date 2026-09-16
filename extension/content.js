@@ -1,8 +1,10 @@
 /* 内容脚本（编排层）：模型列表抓取 + 当前对话识别 + 徽标 + 上报。
  * 重活下沉到各模块——KnowModelScan（列表提取）、KnowModelDetector（对话识别，
  * deep 模式追加"页面数据里的模型 id"扫描）、KnowModelBadge（右下角徽标）、
- * KnowModel（模型小工具）、net-snoop.js（页面上下文网络嗅探）；本文件只做编排：
- * 定时抓取、DOM 变化去抖重检、网络命中合并、popup 刷新消息。
+ * KnowModel（模型小工具）；嗅探载荷 snoopPayload 内联在本文件（函数 toString 注入
+ * 页面上下文，无需再 fetch 自身资源——Firefox 下 fetch 扩展内文件曾报 NetworkError，
+ * 内联后彻底规避）。本文件只做编排：种子目录补齐、定时抓取、DOM 变化去抖重检、
+ * 网络命中合并、popup 刷新消息。
  * TEMP-DIAG：诊断快照 knowmodelDiag（定位 agent 页识别问题用，修好后删除）。
  */
 'use strict';
@@ -16,8 +18,9 @@
     url: location.href,
     title: document.title || '',
     verbose: false,
+    seeded: false,
     events: [],
-    net: { ready: false, idCount: 0, responses: 0, hits: 0, lastHitAt: 0, lastIds: [] },
+    net: { ready: false, idCount: 0, responses: 0, hits: 0, lastHitAt: 0, lastIds: [], lastUrl: '' },
     errors: [],
   };
 
@@ -68,6 +71,38 @@
     } catch (e) {
       diagNote(e, 'publishModelIds');
     }
+  }
+
+  // 缓存为空时（用户只开过 agent/对话页、没去过首页）：拉首页 HTML 解析目录自救。
+  // 同源 fetch，主机权限本来就有，不新增权限。
+  async function seedModelsIfEmpty() {
+    try {
+      const cur = await getStoredModels();
+      if (cur.length) return cur;
+      log('seed: cache empty, fetching homepage catalog');
+      const res = await fetch('https://arena.ai/', { credentials: 'same-origin' });
+      const html = await res.text();
+      const found = KnowModelScan.scanModels({
+        documentElement: { outerHTML: html },
+        querySelectorAll: () => [],
+      });
+      if (found && found.length) {
+        await ext.storage.local.set({ models: found, updatedAt: Date.now(), url: 'https://arena.ai/' });
+        publishModelIds(found);
+        diag.seeded = true;
+        log('seed: got', found.length);
+        try {
+          await ext.runtime.sendMessage({ type: 'knowmodel-updated', count: validCount(found) });
+        } catch (e) {
+          /* 未监听时忽略 */
+        }
+        return found;
+      }
+      diagNote(new Error('seed: no catalog in homepage html'), 'seedModels');
+    } catch (e) {
+      diagNote(e, 'seedModels');
+    }
+    return [];
   }
 
   async function scanModels() {
@@ -141,23 +176,33 @@
     return null;
   }
 
-  // 网络嗅探命中（net-snoop.js 经 CustomEvent 传出）：只合并新 id，不重写已有结论。
+  // 网络嗅探命中（嗅探载荷经 CustomEvent 传出）：首个命中即定论，不追加。
+  // 对话的模型在加载时就确定，后到的响应多为次要内容（推荐/榜单），first-hit-wins
+  // 避免长会话里攒出一堆噪音 id；全部候选仍记进诊断供定位。
   async function onNetHit(ev) {
     try {
       if (listFoundOnPage) return;
       const ids = (ev && ev.detail && ev.detail.ids) || [];
       if (!ids.length) return;
-      log('net hit:', JSON.stringify(ids));
-      const models = await getStoredModels();
-      const byId = Object.create(null);
-      for (const m of models) {
-        if (m && m.id) byId[String(m.id).toLowerCase()] = m;
+      const fromUrl = (ev && ev.detail && ev.detail.url) || '';
+      log('net hit:', JSON.stringify(ids), 'from:', fromUrl.slice(0, 120));
+      try {
+        diag.net.lastUrl = String(fromUrl).slice(0, 200);
+        await persistDiag();
+      } catch (e) {
+        /* 记账失败继续 */
       }
       let cur = null;
       try {
         ({ currentChat: cur } = await ext.storage.local.get(['currentChat']));
       } catch (e) {
         cur = null;
+      }
+      if (cur && cur.source === 'network' && cur.models && cur.models.length) return;
+      const models = await getStoredModels();
+      const byId = Object.create(null);
+      for (const m of models) {
+        if (m && m.id) byId[String(m.id).toLowerCase()] = m;
       }
       const have = Object.create(null);
       const merged = [];
@@ -202,6 +247,7 @@
         hits: d.hits || 0,
         lastHitAt: d.lastHitAt || 0,
         lastIds: d.lastIds || [],
+        lastUrl: d.lastUrl || diag.net.lastUrl || '',
       };
       log('snoop stats:', JSON.stringify(diag.net));
       persistDiag();
@@ -210,23 +256,157 @@
     }
   }
 
-  // 注入页面上下文的嗅探脚本：fetch 自身资源后以内联 <script> 执行（无新增 manifest 权限）。
-  // CSP 若拦截则静默降级，靠 deep 扫描兜底。
+  /* 嗅探载荷：在页面上下文执行（不能用扩展 API，只能读写 DOM）。
+   * hook window.fetch 与 XHR，把 JSON 响应当 UUID token 扫描，只把命中的已知模型 id
+   * 经 CustomEvent 传出去——对话正文不出页面上下文。已知 id 列表由内容脚本经
+   * documentElement 的 data-knowmodel-ids 属性传入。
+   * 注意：本函数经 toString() 序列化后注入，内部不得引用外层作用域任何变量。
+   */
+  function snoopPayload() {
+    var ATTR = 'data-knowmodel-ids';
+    var UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+    var ids = new Set();
+    var seen = new Set();
+    var scanned = 0;
+    var hitCount = 0;
+    var lastHitAt = 0;
+    var lastIds = [];
+    var lastUrl = '';
+    function loadIds() {
+      try {
+        var raw = document.documentElement.getAttribute(ATTR);
+        var arr = raw ? JSON.parse(raw) : [];
+        ids = new Set(
+          (Array.isArray(arr) ? arr : []).map(function (x) {
+            return String(x).toLowerCase();
+          })
+        );
+      } catch (e) {
+        ids = new Set();
+      }
+    }
+    loadIds();
+    try {
+      new MutationObserver(loadIds).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: [ATTR],
+      });
+    } catch (e) {}
+    function emitStats() {
+      try {
+        window.dispatchEvent(
+          new CustomEvent('knowmodel-snoop-stats', {
+            detail: {
+              ready: true,
+              idCount: ids.size,
+              responses: scanned,
+              hits: hitCount,
+              lastHitAt: lastHitAt,
+              lastIds: lastIds.slice(0, 4),
+              lastUrl: lastUrl,
+            },
+          })
+        );
+      } catch (e) {}
+    }
+    function check(text, url) {
+      if (!ids.size || !text || typeof text !== 'string') return;
+      if (text.length > 4 * 1024 * 1024) return;
+      scanned++;
+      if (scanned % 25 === 0) emitStats();
+      var hit = [];
+      UUID_RE.lastIndex = 0;
+      var m;
+      while ((m = UUID_RE.exec(text)) !== null) {
+        var id = m[0].toLowerCase();
+        if (ids.has(id) && !seen.has(id)) {
+          seen.add(id);
+          hit.push(id);
+        }
+        if (hit.length >= 4) break;
+      }
+      if (hit.length) {
+        hitCount += hit.length;
+        lastHitAt = Date.now();
+        lastIds = hit;
+        lastUrl = String(url || '').slice(0, 200);
+        window.dispatchEvent(
+          new CustomEvent('knowmodel-net-hit', { detail: { ids: hit, url: lastUrl } })
+        );
+        emitStats();
+      }
+    }
+    function looksLikeData(res) {
+      try {
+        var ct = String((res.headers && res.headers.get('content-type')) || '').toLowerCase();
+        return ct.indexOf('json') !== -1 || ct.indexOf('text') !== -1 || ct.indexOf('flight') !== -1;
+      } catch (e) {
+        return false;
+      }
+    }
+    function reqUrl(input) {
+      try {
+        if (typeof input === 'string') return input;
+        if (input && input.url) return input.url;
+      } catch (e) {}
+      return '';
+    }
+    try {
+      var origFetch = window.fetch;
+      window.fetch = function (input) {
+        var url = reqUrl(input);
+        return origFetch.apply(this, arguments).then(function (res) {
+          try {
+            if (looksLikeData(res)) {
+              res
+                .clone()
+                .text()
+                .then(function (t) {
+                  check(t, url);
+                })
+                .catch(function () {});
+            }
+          } catch (e) {}
+          return res;
+        });
+      };
+    } catch (e) {}
+    try {
+      var origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.send = function () {
+        var xhr = this;
+        try {
+          xhr.addEventListener('load', function () {
+            try {
+              if (typeof xhr.responseText === 'string') check(xhr.responseText, xhr.responseURL);
+            } catch (e) {}
+          });
+        } catch (e) {}
+        return origSend.apply(this, arguments);
+      };
+    } catch (e) {}
+    emitStats();
+  }
+
+  // 注入页面上下文的嗅探脚本：函数 toString 内联执行，不 fetch 自身资源（Firefox 曾因此失败）。
+  // CSP 若拦截则静默降级，靠 deep 扫描兜底；5 秒没收到 ready 回报就记一笔以便区分。
   let snoopInjected = false;
-  async function ensureNetSnoop() {
+  function ensureNetSnoop() {
     if (snoopInjected) return;
     snoopInjected = true;
     try {
-      const src = await (await fetch(ext.runtime.getURL('net-snoop.js'))).text();
-      if (!src) {
-        diagNote(new Error('empty snoop source'), 'ensureNetSnoop');
-        return;
-      }
+      const src = '(' + snoopPayload.toString() + ')();';
       const el = document.createElement('script');
       el.textContent = src;
       (document.head || document.documentElement).appendChild(el);
       el.remove();
       log('snoop injected, src len:', src.length);
+      setTimeout(() => {
+        if (!diag.net.ready) {
+          diagNote(new Error('no snoop ready after 5s (CSP?)'), 'ensureNetSnoop');
+          persistDiag();
+        }
+      }, 5000);
     } catch (e) {
       diagNote(e, 'ensureNetSnoop');
     }
@@ -253,10 +433,15 @@
   }
 
   async function fullScan() {
-    const models = await scanModels();
+    let models = await scanModels();
     if (!models || !models.length) {
-      // 无列表页（agent/对话页）：用缓存 id 喂嗅探器，并做 deep 扫描
-      publishModelIds(await getStoredModels());
+      // 无列表页（agent/对话页）：先用缓存 id 喂嗅探器；缓存也没有就拉首页自救
+      const cached = await getStoredModels();
+      if (cached.length) {
+        publishModelIds(cached);
+      } else {
+        models = await seedModelsIfEmpty();
+      }
     }
     ensureNetSnoop();
     const chat = await updateCurrentChat(!models || !models.length);
@@ -267,6 +452,7 @@
       diag.events.push({
         t: Date.now(),
         listFound: !!(models && models.length),
+        seeded: diag.seeded,
         mode: chat && chat.mode,
         source: chat && chat.source,
         modelNames: ((chat && chat.models) || []).map((m) => m.publicName),

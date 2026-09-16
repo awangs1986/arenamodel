@@ -1,7 +1,7 @@
 # knowmodel Firefox 版
 
 与 Chrome 版共用同一套逻辑文件（`ext.js` / `model-utils.js` / `detector.js` /
-`models-scan.js` / `badge.js` / `net-snoop.js` / `content.js` / `popup.js` /
+`models-scan.js` / `badge.js` / `content.js` / `popup.js` /
 `background.js` / `popup.html` 完全相同），只有 `manifest.json` 是 Firefox 专用的。
 原理、界面、用法都一样，详见 `../extension/README.md`。
 
