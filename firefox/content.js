@@ -289,10 +289,14 @@
      * Trigger.dev 上该 run 的 trace：ai.streamText.doStream span 里 icon 含
      * cube 的标签就是 worker 写入的真实模型名。全程只传 token/runId/模型名。 */
     var TRIGGER_API = 'https://api.trigger.dev';
-    var TOKEN_RE = /public-access-token[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})/;
+    // 原版是 /access-token/i.test(headerName) —— 任何含 access-token 的头名都收，
+    // 不写死 public- 前缀（站点改名不至于失效）。shape 校验同原版
+    // /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/。
+    var JWT_SHAPE_RE = /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/;
+    var TOKEN_RE = /([A-Za-z0-9_.-]*access-token[A-Za-z0-9_.-]*)[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)/i;
     var STREAM_URL_RE = /(stream|conversation|agent|chat|run|events|realtime|batch|\/api\/)/i;
     var STATIC_EXT_RE = /\.(?:js|css|png|jpe?g|gif|svg|woff2?|ttf|ico|map|mp4|webp|avif)(?:\?|$)/i;
-    var run = { token: null, runId: null, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0 };
+    var run = { token: null, runId: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0 };
     function b64url(s) {
       try {
         s = String(s).replace(/-/g, '+').replace(/_/g, '/');
@@ -329,7 +333,7 @@
     function findToken(text) {
       try {
         var m = TOKEN_RE.exec(text || '');
-        return m ? m[1] : null;
+        return m ? m[2] : null;
       } catch (e) { return null; }
     }
     function stopPoll() {
@@ -340,11 +344,18 @@
     function acceptToken(token) {
       if (!token || typeof token !== 'string') return;
       if (token === run.token) return;
+      if (!JWT_SHAPE_RE.test(token)) return;
       var rid = runIdFromToken(token);
-      if (!rid) return;
+      var exp = 0;
+      try {
+        var p = JSON.parse(b64url(String(token).split('.')[1]));
+        exp = (p && p.exp) || 0;
+      } catch (e) {}
       stopPoll();
       run.token = token;
-      run.runId = rid;
+      // 原版：rid 解不出时保留旧 runId（同一 run 的续期 token 仍可用）。
+      run.runId = rid || run.runId;
+      run.exp = exp;
       run.fetches = 0;
       run.found = null;
       run.error = '';
@@ -361,25 +372,36 @@
     function pollOnce() {
       run.tries++;
       var token = run.token, rid = run.runId;
-      if (!token || !rid) { stopPoll(); return; }
+      if (!token || !rid) { run.error = 'no-token'; stopPoll(); emitStats(); return; }
+      // 同原版 fetchRunModels：过期就不再打了（早停，不耗到 30 次）。
+      if (run.exp && Date.now() > run.exp * 1000) { run.error = 'token-expired'; stopPoll(); emitStats(); return; }
       run.fetches++;
       emitStats();
+      // 同原版：20s AbortController 超时，跨域挂起也不至于永远卡住。
+      var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+      var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 20000);
+      var done = function () { try { clearTimeout(timer); } catch (e) {} };
       fetch(TRIGGER_API + '/api/v1/runs/' + rid + '/events', {
         method: 'GET',
         headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
         credentials: 'omit',
+        signal: ctrl ? ctrl.signal : undefined,
       }).then(function (res) {
         if (!res.ok) throw new Error('http-' + res.status);
         return res.text();
       }).then(function (text) {
+        done();
         run.error = '';
         var labels = extractLabels(text);
         if (labels.length) {
-          var name = labels[labels.length - 1];
+          // 同原版：去重后取最后一个（最后一次调用的模型）。
+          var uniq = [];
+          for (var i = 0; i < labels.length; i++) if (uniq.indexOf(labels[i]) < 0) uniq.push(labels[i]);
+          var name = uniq[uniq.length - 1];
           run.found = name;
           stopPoll();
           try {
-            window.dispatchEvent(new CustomEvent('knowmodel-run-model', { detail: { name: name, runId: rid, all: labels } }));
+            window.dispatchEvent(new CustomEvent('knowmodel-run-model', { detail: { name: name, runId: rid, all: uniq } }));
           } catch (e) {}
         } else if (run.tries >= 30) {
           run.error = 'timeout';
@@ -387,7 +409,9 @@
         }
         emitStats();
       }).catch(function (err) {
-        run.error = String((err && err.message) || err).slice(0, 80);
+        done();
+        var msg = String((err && err.name === 'AbortError') ? 'timeout-20s' : ((err && err.message) || err));
+        run.error = msg.slice(0, 80);
         if (run.tries >= 30) stopPoll();
         emitStats();
       });
@@ -560,6 +584,7 @@
           stopPoll();
           run.token = null;
           run.runId = null;
+          run.exp = 0;
           run.fetches = 0;
           run.found = null;
           run.error = '';
@@ -645,7 +670,8 @@
   }
 
   // 页面 HTML 里残留的 token（历史流）：喂给页面世界走同一条取证管线。
-  const TOKEN_RE = /public-access-token[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})/;
+  // 头名与 shape 判定跟页面世界同源（任何 *access-token 头 + eyJ JWT）。
+  const TOKEN_RE = /(?:[A-Za-z0-9_.-]*access-token[A-Za-z0-9_.-]*)[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)/i;
   function seedRunToken() {
     try {
       const html = (document.documentElement && document.documentElement.outerHTML) || '';
