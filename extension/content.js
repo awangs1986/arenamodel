@@ -17,7 +17,7 @@
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
-    build: '20260917-expiry-gate',
+    build: '20260917-hdr-carrier',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -305,7 +305,7 @@
     // 会话制正门形态：{"token": "eyJ..."}（键名就是 token，无 access-token 标签）。
     var TOKEN_JSON_RE = /"(?:public-access-token|access-token|token|runToken)"\s*:\s*"(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"/;
     var REALTIME_BASE = 'https://api.trigger.dev';
-    var run = { token: null, runId: null, sess: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqRuns: [] };
+    var run = { token: null, runId: null, sess: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqHdrs: [], reqRuns: [] };
     // 跳过的条目不值得每次都刷诊断（storage 写太频繁）；节流到 2s 一次。
     // 旁路的流由 watchStream 即时 emit，这里只管“跳过”那一侧。
     var lastTapEmit = 0;
@@ -464,15 +464,26 @@
       var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
       var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 20000);
       var done = function () { try { clearTimeout(timer); } catch (e) {} };
-      fetch(TRIGGER_API + '/api/v1/runs/' + rid + '/events', {
-        method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
-        credentials: 'omit',
-        signal: ctrl ? ctrl.signal : undefined,
-      }).then(function (res) {
-        if (!res.ok) throw new Error('http-' + res.status);
-        return res.text();
-      }).then(function (text) {
+      // events 双路：直连老路优先（实测走通过），同源代理兜底（SPA 已改走
+      // /ai-proxy，哪天直连被关还能活）。
+      var evUrls = [
+        { u: TRIGGER_API + '/api/v1/runs/' + rid + '/events', c: 'omit' },
+        { u: '/ai-proxy/api/v1/runs/' + rid + '/events', c: 'same-origin' },
+      ];
+      function evAttempt(i) {
+        var cfg = evUrls[Math.min(i, evUrls.length - 1)];
+        return fetch(cfg.u, {
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
+          credentials: cfg.c,
+          signal: ctrl ? ctrl.signal : undefined,
+        }).then(function (res) {
+          if (!res.ok && i + 1 < evUrls.length) return evAttempt(i + 1);
+          if (!res.ok) throw new Error('http-' + res.status);
+          return res.text();
+        });
+      }
+      evAttempt(0).then(function (text) {
         done();
         run.error = '';
         var labels = extractLabels(text);
@@ -510,15 +521,26 @@
       var ctrl = typeof AbortController === 'function' ? new AbortController() : null;
       var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, 20000);
       var done = function () { try { clearTimeout(timer); } catch (e) {} };
-      fetch(REALTIME_BASE + '/realtime/v1/sessions/' + encodeURIComponent(run.sess) + '/out/records', {
-        method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + run.token, 'Accept': 'application/json' },
-        credentials: 'omit',
-        signal: ctrl ? ctrl.signal : undefined,
-      }).then(function (res) {
-        if (!res.ok) throw new Error('http-' + res.status);
-        return res.text();
-      }).then(function (text) {
+      // 排水分发双路：同源代理优先（SPA 现在就走 /ai-proxy/realtime/...），
+      // 直连老路兜底；单条失败自动换路，不再绑死一个域。
+      var recUrls = [
+        { u: '/ai-proxy/realtime/v1/sessions/' + encodeURIComponent(run.sess) + '/out/records', c: 'same-origin' },
+        { u: REALTIME_BASE + '/realtime/v1/sessions/' + encodeURIComponent(run.sess) + '/out/records', c: 'omit' },
+      ];
+      function recAttempt(i) {
+        var cfg = recUrls[Math.min(i, recUrls.length - 1)];
+        return fetch(cfg.u, {
+          method: 'GET',
+          headers: { 'Authorization': 'Bearer ' + run.token, 'Accept': 'application/json' },
+          credentials: cfg.c,
+          signal: ctrl ? ctrl.signal : undefined,
+        }).then(function (res) {
+          if (!res.ok && i + 1 < recUrls.length) return recAttempt(i + 1);
+          if (!res.ok) throw new Error('http-' + res.status);
+          return res.text();
+        });
+      }
+      recAttempt(0).then(function (text) {
         done();
         run.error = '';
         // 从尾往前找最后一条 turn-complete 的 public-access-token（最新一轮）。
@@ -758,7 +780,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260917-expiry-gate', hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260917-hdr-carrier', hasToken: !!run.token, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -806,12 +828,60 @@
       } catch (e) {}
       return '';
     }
+    // 请求侧 token 捕获：新站 SPA 打开旧对话已不调 trigger-token（诊断实锤：
+    // 3 次正门请求全是自取的 15s 重试、响应里无 token），鉴权改在
+    // /ai-proxy/realtime/.../out、/in/append 的【请求头】里带（Bearer JWT）。
+    // 从 init/input 收集请求头，值像 JWT 且带 runs/sessions 权限就收——
+    // 名字不设限（Authorization/x-*/随便）；头名记进 reqHdrs 供下次诊断定位。
+    function collectReqHeaders(input, init) {
+      var out = [];
+      function add(k, v) { try { out.push([String(k), String(v)]); } catch (e) {} }
+      function each(h) {
+        try {
+          if (!h) return;
+          if (typeof h.forEach === 'function') { h.forEach(function (v, k) { add(k, v); }); return; }
+          var ks = Object.keys(h);
+          for (var i = 0; i < ks.length; i++) add(ks[i], h[ks[i]]);
+        } catch (e) {}
+      }
+      try { if (input && input.headers) each(input.headers); } catch (e) {}
+      try { if (init && init.headers) each(init.headers); } catch (e) {}
+      return out;
+    }
+    var REQ_JWT_RE = /^(?:Bearer\s+)?(eyJ[\w-]+\.[\w-]+\.[\w-]+)$/i;
+    function captureReqToken(input, init, url) {
+      try {
+        var su = String(url || '');
+        var arenaish = !/^https?:\/\//i.test(su) || /arena\.ai|trigger\.dev/i.test(su);
+        if (!arenaish) return;
+        var pairs = collectReqHeaders(input, init);
+        var names = [], hit = '', hitName = '';
+        for (var i = 0; i < pairs.length; i++) {
+          names.push(String(pairs[i][0] || '').toLowerCase());
+          if (!hit) {
+            var mm = REQ_JWT_RE.exec(String(pairs[i][1] || '').trim());
+            if (mm) { hit = mm[1]; hitName = String(pairs[i][0] || ''); }
+          }
+        }
+        if (!hit) {
+          var um = /[?&](?:token|access[-_]?token|jwt)=(eyJ[\w-]+\.[\w-]+\.[\w-]+)/i.exec(su);
+          if (um) { hit = um[1]; hitName = 'url-query'; }
+        }
+        if (/ai-proxy|realtime|trigger-token|\/in\/append|\/out/i.test(su) || hit) {
+          run.reqHdrs.push({ t: Date.now(), u: su.slice(-60), hn: names.join(',').slice(0, 120), tok: hitName });
+          if (run.reqHdrs.length > 12) run.reqHdrs.shift();
+        }
+        if (hit && tokenHasRunScope(hit)) acceptToken(hit);
+      } catch (e) {}
+    }
     try {
       var origFetch = window.fetch;
       // 防重包（学原版 __probeWrapped）：SPA/二次注入不再叠床架屋，否则 taps 双计。
       if (origFetch && !origFetch.__kmpWrapped) {
       var kmpFetch = function (input) {
         var url = reqUrl(input);
+        // 请求头先于响应就有 token——SPA 打开 /out 那一刻就能拿到会话 JWT。
+        try { captureReqToken(input, arguments[1], url); } catch (eH) {}
         return origFetch.apply(this, arguments).then(function (res) {
           try {
             // 门槛学原版 shouldInspect：流式 CT / 无 CT / LLM 风格 URL 都旁路。
@@ -835,12 +905,20 @@
             // trigger-token 专线：会话制正门的响应（{"token": JWT}）不等通用
             // clone().text() 链——那条链只认 access-token 标签，会漏抓。
             try {
-              if (!run.token && /trigger-token/i.test(url || '')) {
+              if (/trigger-token/i.test(url || '')) {
+                if (entry) { try { entry.st = (res && res.status) || 0; } catch (eS) {} }
                 res.clone().text().then(function (tt) {
                   try {
+                    if (entry) {
+                      // 正门响应形态取证：JWT 打码留长度，正文截 140 字符——
+                      // 下次诊断直接看到它到底返回了什么形状。
+                      entry.bs = String(tt || '').slice(0, 140).replace(/ey[A-Za-z0-9_\-]{6,}/g, function (s) { return 'eyJ…(' + s.length + ')'; });
+                    }
                     if (run.token) return;
                     var mm = TOKEN_JSON_RE.exec(tt || '');
-                    if (mm && mm[1]) acceptToken(mm[1]);
+                    if (mm && mm[1]) { acceptToken(mm[1]); return; }
+                    var bare = String(tt || '').trim();
+                    if (/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(bare)) acceptToken(bare);
                   } catch (e9) {}
                 }).catch(function () {});
               }
