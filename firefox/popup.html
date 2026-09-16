@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  body { width: 380px; margin: 0; padding: 12px; font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; color: #222; }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  #updated { color: #888; font-size: 11px; margin-bottom: 8px; }
+  #q { width: 100%; padding: 7px 9px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px; margin-bottom: 6px; }
+  #stat { color: #555; font-size: 12px; margin: 2px 0 6px; }
+  #list { max-height: 320px; overflow-y: auto; border: 1px solid #eee; border-radius: 6px; }
+  .row { padding: 7px 9px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+  .row:last-child { border-bottom: none; }
+  .row:hover { background: #f5f9ff; }
+  .name { font-weight: 600; margin-bottom: 3px; word-break: break-all; }
+  .meta { margin-bottom: 2px; }
+  .chip { display: inline-block; font-size: 11px; background: #eef2f7; color: #445; border-radius: 4px; padding: 1px 6px; margin-right: 4px; }
+  .chip.org { background: #e3f0ff; color: #1663c7; }
+  .id { font-size: 11px; color: #999; font-family: monospace; word-break: break-all; }
+  #empty { display: none; padding: 18px 10px; text-align: center; color: #888; line-height: 1.8; }
+  #hint { min-height: 18px; font-size: 12px; color: #a60; margin: 6px 0; }
+  #chatCard { border: 1px solid #d6e4ff; background: #f7faff; border-radius: 6px; padding: 8px 9px; margin-bottom: 8px; }
+  #chatTitle { font-weight: 700; margin-bottom: 2px; }
+  #chatMode { font-size: 12px; color: #555; margin-bottom: 4px; }
+  .chat-empty { color: #888; font-size: 12px; line-height: 1.7; }
+  .btns { display: flex; gap: 8px; }
+  button { flex: 1; padding: 8px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  #refresh { background: #1a73e8; color: #fff; }
+  #refresh:hover { background: #1558b0; }
+  #open { background: #eef2f7; color: #333; }
+  #toast { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%) translateY(10px); background: #333; color: #fff; font-size: 12px; padding: 6px 14px; border-radius: 6px; opacity: 0; transition: all .2s; pointer-events: none; }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+  <h1>arena.ai 当前模型 <span id="stat"></span></h1>
+  <div id="updated"></div>
+  <div id="chatCard">
+    <div id="chatTitle">当前对话</div>
+    <div id="chatMode"></div>
+    <div id="chatBox"><div class="chat-empty">检测中…</div></div>
+  </div>
+  <input id="q" type="text" placeholder="搜索模型名 / 厂商…">
+  <div id="list"></div>
+  <div id="empty">还没有数据。<br>先打开 arena.ai 等页面加载完，再点下方「刷新」。</div>
+  <div id="hint"></div>
+  <div class="btns">
+    <button id="refresh">刷新</button>
+    <button id="open">打开 arena.ai</button>
+  </div>
+  <div id="toast"></div>
+  <script src="ext.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
