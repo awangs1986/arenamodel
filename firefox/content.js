@@ -478,6 +478,12 @@
               // 消息频率可能高：每 10 条或拿到 token 时才刷一次统计。
               if (run.sockMsgs % 10 === 0 || !run.token) emitStats();
               var d = typeof ev.data === 'string' ? ev.data : '';
+              if (!d && ev.data instanceof ArrayBuffer && typeof TextDecoder === 'function') {
+                try { d = new TextDecoder().decode(ev.data); } catch (e2) { d = ''; }
+              }
+              if (!d && typeof Blob === 'function' && ev.data instanceof Blob) {
+                try { ev.data.text().then(function (t) { if (!run.token) { var tk2 = findToken(t); if (tk2) acceptToken(tk2); } }).catch(function () {}); return; } catch (e2) {}
+              }
               if (!run.token && d) {
                 var tk = findToken(d);
                 if (tk) acceptToken(tk);
