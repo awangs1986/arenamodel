@@ -129,7 +129,7 @@
     };
   }
 
-  async function updateCurrentChat(deep) {
+  async function updateCurrentChat(deep, force) {
     try {
       const models = await getStoredModels();
       const st = KnowModelDetector.detect(location.href, document, models, { deep: !!deep });
@@ -143,9 +143,11 @@
       };
       // 同一 URL 下不降级：本轮没找到但之前已确认过模型（多为网络嗅探结论），
       // 保留旧结论只刷新时间；URL 变了则无条件接受新结论（SPA 切页不留旧数据）。
+      // 手动刷新（force）绕过保护：用户点了刷新就是要重认，旧结论再可疑也得让位。
       try {
         const { currentChat: prev } = await ext.storage.local.get(['currentChat']);
         if (
+          !force &&
           prev &&
           prev.url === payload.url &&
           !payload.models.length &&
@@ -198,6 +200,9 @@
       } catch (e) {
         cur = null;
       }
+      // 跨对话隔离：存的结论属于别的 URL（已经切了对话），本页从零开始，
+      // 否则上一个对话的首命中会吞掉新对话的命中（first-hit-wins 误伤）。
+      if (cur && cur.url && cur.url !== location.href) cur = null;
       if (cur && cur.source === 'network' && cur.models && cur.models.length) return;
       const models = await getStoredModels();
       const byId = Object.create(null);
@@ -432,7 +437,7 @@
     /* 读不到开关就保持关闭 */
   }
 
-  async function fullScan() {
+  async function fullScan(force) {
     let models = await scanModels();
     if (!models || !models.length) {
       // 无列表页（agent/对话页）：先用缓存 id 喂嗅探器；缓存也没有就拉首页自救
@@ -444,7 +449,7 @@
       }
     }
     ensureNetSnoop();
-    const chat = await updateCurrentChat(!models || !models.length);
+    const chat = await updateCurrentChat(!models || !models.length, !!force);
     // TEMP-DIAG：记一笔 pipeline 快照
     try {
       diag.url = location.href;
@@ -493,7 +498,17 @@
       lastHref = location.href;
       listFoundOnPage = false;
       tries = 0;
+      // 切对话了：立刻清零旧结论，别让上一个对话的模型赖在屏幕上；
+      // 新结论由随后几轮扫描（尤其网络首命中）填进来。
+      try {
+        const reset = { mode: 'unknown', revealed: false, models: [], source: 'none', url: lastHref, updatedAt: Date.now() };
+        ext.storage.local.set({ currentChat: reset });
+        KnowModelBadge.show(document, KnowModelBadge.textFor(reset));
+      } catch (e) {
+        diagNote(e, 'nav-reset');
+      }
       diag.events.push({ t: Date.now(), nav: lastHref });
+      persistDiag();
       armScan();
     }
   }, 2000);
@@ -503,7 +518,7 @@
   try {
     const mo = new MutationObserver(() => {
       clearTimeout(moTimer);
-      moTimer = setTimeout(() => updateCurrentChat(false), 1200);
+      moTimer = setTimeout(() => updateCurrentChat(false, false), 1200);
     });
     mo.observe(document.documentElement, { childList: true, characterData: true, subtree: true });
   } catch (e) {
@@ -512,7 +527,7 @@
 
   ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg && msg.type === 'knowmodel-rescan') {
-      fullScan().then((r) =>
+      fullScan(true).then((r) =>
         sendResponse({
           ok: !!(r.models && r.models.length),
           count: r.models ? validCount(r.models) : 0,
