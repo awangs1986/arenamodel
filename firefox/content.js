@@ -452,7 +452,7 @@
       if (token && !rid && run.sess) { fetchSessionRun(); return; }
       if (!token || !rid) { run.error = 'no-token'; stopPoll(); emitStats(); return; }
       // 同原版 fetchRunModels：过期就不再打了（早停，不耗到 30 次）。
-      if (run.exp && Date.now() > run.exp * 1000) { run.error = 'token-expired'; stopPoll(); emitStats(); return; }
+      if (run.exp && Date.now() > run.exp * 1000) { run.error = 'token-expired'; stopPoll(); emitStats(); rescueToken(); return; }
       run.fetches++;
       emitStats();
       // 同原版：20s AbortController 超时，跨域挂起也不至于永远卡住。
@@ -490,7 +490,7 @@
         done();
         var msg = String((err && err.name === 'AbortError') ? 'timeout-20s' : ((err && err.message) || err));
         run.error = msg.slice(0, 80);
-        if (run.tries >= 30) stopPoll();
+        if (run.tries >= 30) { stopPoll(); rescueToken(); }
         emitStats();
       });
     }
@@ -551,29 +551,40 @@
           run.error = '';
           emitStats();
           pollOnce();
-        } else if (run.tries >= 30 || run.sessTries >= 3) {
-          run.error = run.tries >= 30 ? 'timeout' : 'no-run-yet';
+        } else if (run.tries >= 30) {
+          run.error = 'timeout';
           stopPoll();
           emitStats();
+          rescueToken();
         } else {
-          // 本轮还没 turn-complete（刚发送）：不等 6s，2s 后再排一次。
-          run.error = '';
+          // 本轮还没 turn-complete（空对话/刚发送）：3 次内 2s 快排，之后转
+          // 6s 慢轮直到 30 次——“切到空对话后才发话”也能等到，不早停。
+          run.error = run.sessTries >= 3 ? 'waiting-run' : '';
           emitStats();
-          try { setTimeout(function () { if (run.polling) pollOnce(); }, 2000); } catch (e4) {}
+          if (run.sessTries < 3) {
+            try { setTimeout(function () { if (run.polling) pollOnce(); }, 2000); } catch (e4) {}
+          }
         }
       }).catch(function (err) {
         done();
         var msg = String((err && err.name === 'AbortError') ? 'timeout-20s' : ((err && err.message) || err));
         run.error = msg.slice(0, 80);
-        if (run.tries >= 30) stopPoll();
+        if (run.tries >= 30) { stopPoll(); rescueToken(); }
         emitStats();
       });
     }
     // 主动取 token：会话制下 token 按会话缓存，后几轮页面不再请求正门，
     // 等是等不来的；页面 cookie 还在，自己 GET 一次即可（幂等、无副作用）。
     var tokenFetching = false, directTries = 0;
-    function fetchDirectToken() {
-      if (tokenFetching || run.token) return;
+    // 终局自救：token 过期/切页残留导致整条链走死时，直接向正门要一张当下
+    // 有效的（同会话续期或新会话）；acceptToken 鉴别，相同则忽略，不循环。
+    function rescueToken() {
+      try { fetchDirectToken(true); } catch (e) {}
+    }
+    function fetchDirectToken(force) {
+      if (tokenFetching || (!force && run.token)) return;
+      if (directTries >= 3) return;
+      directTries++;
       tokenFetching = true;
       try {
         fetch('/api/chat/trigger-token', { credentials: 'same-origin' }).then(function (res) {
@@ -582,7 +593,7 @@
           return res.text();
         }).then(function (t) {
           try {
-            if (!t || run.token) return;
+            if (!t || (!force && run.token)) return;
             var mm = TOKEN_JSON_RE.exec(t);
             if (mm && mm[1]) acceptToken(mm[1]);
           } catch (e) {}
@@ -594,12 +605,28 @@
       try {
         if (run.token || directTries >= 3) return;
         if (typeof location === 'undefined' || !/(agent|chat)/i.test(location.href)) return;
-        directTries++;
-        fetchDirectToken();
+        fetchDirectToken(false);
         if (!run.token && directTries < 3) setTimeout(maybeDirectToken, 15000);
       } catch (e) {}
     }
     try { setTimeout(maybeDirectToken, 8000); } catch (e) {}
+    // SPA 跳转即时通知内容世界：只靠内容世界的 2s 轮询会晚到——页面切页后立刻
+    // 取新 token，而旧状态还没清，新 token 会撞上 !run.token 守卫被漏掉。
+    try {
+      var __kmpNavFire = function () {
+        try { window.dispatchEvent(new CustomEvent('knowmodel-nav', { detail: { href: String(location.href) } })); } catch (e) {}
+      };
+      if (typeof history !== 'undefined' && history.pushState && !history.pushState.__kmpNavWrapped) {
+        var __kmpOps = history.pushState, __kmpOrr = history.replaceState;
+        var __kmpNp = function () { var r = __kmpOps.apply(this, arguments); try { __kmpNavFire(); } catch (e) {} return r; };
+        var __kmpNr = function () { var r = __kmpOrr.apply(this, arguments); try { __kmpNavFire(); } catch (e) {} return r; };
+        __kmpNp.__kmpNavWrapped = true;
+        __kmpNr.__kmpNavWrapped = true;
+        history.pushState = __kmpNp;
+        history.replaceState = __kmpNr;
+      }
+      window.addEventListener('popstate', function () { try { __kmpNavFire(); } catch (e) {} });
+    } catch (e) {}
     function watchStream(res, url, entry) {
       run.taps++;
       // 常驻流档案：tapLog 是滚动窗（遥测几分钟就冲掉证据），streams 只记
@@ -1014,7 +1041,12 @@
   // 页面 HTML 里残留的 token（历史流）：喂给页面世界走同一条取证管线。
   // 头名与 shape 判定跟页面世界同源（任何 *access-token 头 + eyJ JWT）。
   const TOKEN_RE = /(?:[A-Za-z0-9_.-]*access-token[A-Za-z0-9_.-]*)[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)/i;
+  // 切页后 DOM 是旧对话的水合残留：此时再喂 token 会把旧 token 灌进已清空
+  // 的页面世界，旧 token 占位挡掉新链路（专线/自取全看 !run.token）→ 永久未检测到。
+  // 所以残留种子只在本次文档载入、尚未观测到切页时喂；切页后靠页面自取 + 专线。
+  let navSeen = false;
   function seedRunToken() {
+    if (navSeen) return;
     try {
       const html = (document.documentElement && document.documentElement.outerHTML) || '';
       const m = TOKEN_RE.exec(html.slice(0, 4 * 1024 * 1024));
@@ -1122,25 +1154,40 @@
   ensureNetSnoop();
   if (!isTopFrame) return;
   armScan();
-  setInterval(() => {
-    if (location.href !== lastHref) {
-      lastHref = location.href;
-      listFoundOnPage = false;
-      tries = 0;
-      // 切对话了：立刻清零旧结论，别让上一个对话的模型赖在屏幕上；
-      // 新结论由随后几轮扫描（运行轨迹/网络首命中）填进来。页面世界的轮询也要停。
-      notifyPageNavReset();
-      try {
-        const reset = { mode: 'unknown', revealed: false, models: [], source: 'none', url: lastHref, updatedAt: Date.now() };
-        ext.storage.local.set({ currentChat: reset });
-        KnowModelBadge.show(document, KnowModelBadge.textFor(reset));
-      } catch (e) {
-        diagNote(e, 'nav-reset');
-      }
-      diag.events.push({ t: Date.now(), nav: lastHref });
-      persistDiag();
-      armScan();
+  function chatPath(href) {
+    try { return new URL(href).pathname; } catch (e) { return String(href || ''); }
+  }
+  function handleNavReset(newHref) {
+    lastHref = newHref;
+    navSeen = true;
+    listFoundOnPage = false;
+    tries = 0;
+    // 切对话了：立刻清零旧结论，别让上一个对话的模型赖在屏幕上；
+    // 新结论由随后几轮扫描（运行轨迹/网络首命中）填进来。页面世界的轮询也要停。
+    notifyPageNavReset();
+    try {
+      const reset = { mode: 'unknown', revealed: false, models: [], source: 'none', url: lastHref, updatedAt: Date.now() };
+      ext.storage.local.set({ currentChat: reset });
+      KnowModelBadge.show(document, KnowModelBadge.textFor(reset));
+    } catch (e) {
+      diagNote(e, 'nav-reset');
     }
+    diag.events.push({ t: Date.now(), nav: lastHref });
+    persistDiag();
+    armScan();
+  }
+  // 页面世界 history 跳转即时事件（pushState/replaceState/popstate）：pathname
+  // 变了才是真切页，query/hash 小动静不折腾（2s 兜底轮询仍看全 href）。
+  try {
+    window.addEventListener('knowmodel-nav', (ev) => {
+      try {
+        const h = ev && ev.detail && ev.detail.href;
+        if (h && chatPath(h) !== chatPath(lastHref)) handleNavReset(h);
+      } catch (e) {}
+    });
+  } catch (e) {}
+  setInterval(() => {
+    if (location.href !== lastHref) handleNavReset(location.href);
   }, 2000);
 
   // 流式输出 / 投票揭晓都会改 DOM：去抖后重检对话状态（轻量检测，不重做 deep 扫描）
