@@ -206,6 +206,8 @@
       // 跨对话隔离：存的结论属于别的 URL（已经切了对话），本页从零开始，
       // 否则上一个对话的首命中会吞掉新对话的命中（first-hit-wins 误伤）。
       if (cur && cur.url && cur.url !== location.href) cur = null;
+      // 运行轨迹结论最高权威：同 URL 下网络命中不得覆盖它。
+      if (cur && cur.source === 'run-trace' && cur.models && cur.models.length) return;
       if (cur && cur.source === 'network' && cur.models && cur.models.length) return;
       const models = await getStoredModels();
       const byId = Object.create(null);
@@ -256,6 +258,7 @@
         lastHitAt: d.lastHitAt || 0,
         lastIds: d.lastIds || [],
         lastUrl: d.lastUrl || diag.net.lastUrl || '',
+        run: d.run || diag.net.run || null,
       };
       log('snoop stats:', JSON.stringify(diag.net));
       persistDiag();
@@ -280,6 +283,136 @@
     var lastHitAt = 0;
     var lastIds = [];
     var lastUrl = '';
+    /* ---- 运行轨迹取证（思路学自 Arena模型助手探针的 runmodel 链，实现重写）----
+     * agent 页响应流里不含模型名，但流的 records[].headers 会下发
+     * public-access-token（JWT，scope 含 read:runs:<runId>）。拿它去读
+     * Trigger.dev 上该 run 的 trace：ai.streamText.doStream span 里 icon 含
+     * cube 的标签就是 worker 写入的真实模型名。全程只传 token/runId/模型名。 */
+    var TRIGGER_API = 'https://api.trigger.dev';
+    var TOKEN_RE = /public-access-token[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})/;
+    var STREAM_URL_RE = /(stream|conversation|agent|chat|run|events|realtime|batch|\/api\/)/i;
+    var STATIC_EXT_RE = /\.(?:js|css|png|jpe?g|gif|svg|woff2?|ttf|ico|map|mp4|webp|avif)(?:\?|$)/i;
+    var run = { token: null, runId: null, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0 };
+    function b64url(s) {
+      try {
+        s = String(s).replace(/-/g, '+').replace(/_/g, '/');
+        while (s.length % 4) s += '=';
+        return atob(s);
+      } catch (e) { return ''; }
+    }
+    function runIdFromToken(token) {
+      try {
+        var parts = String(token).split('.');
+        if (parts.length < 2) return null;
+        var p = JSON.parse(b64url(parts[1]));
+        if (!p) return null;
+        var scopes = p.scopes || [];
+        for (var i = 0; i < scopes.length; i++) {
+          var m = String(scopes[i]).match(/(?:read|write):[A-Za-z]+:(run_[A-Za-z0-9]+)/);
+          if (m) return m[1];
+        }
+        var m2 = JSON.stringify(p).match(/(run_[A-Za-z0-9]{10,})/);
+        if (m2) return m2[1];
+      } catch (e) {}
+      return null;
+    }
+    function extractLabels(text) {
+      var models = [];
+      if (typeof text !== 'string' || !text) return models;
+      var re = /"text"\s*:\s*"([^"]{1,80})"\s*,\s*"icon"\s*:\s*"([^"]{1,40})"/g;
+      var m;
+      while ((m = re.exec(text)) !== null) {
+        if (m[2].indexOf('cube') >= 0) models.push(m[1]);
+      }
+      return models;
+    }
+    function findToken(text) {
+      try {
+        var m = TOKEN_RE.exec(text || '');
+        return m ? m[1] : null;
+      } catch (e) { return null; }
+    }
+    function stopPoll() {
+      try { if (run.timer && typeof clearInterval === 'function') clearInterval(run.timer); } catch (e) {}
+      run.timer = 0;
+      run.polling = false;
+    }
+    function acceptToken(token) {
+      if (!token || typeof token !== 'string') return;
+      if (token === run.token) return;
+      var rid = runIdFromToken(token);
+      if (!rid) return;
+      stopPoll();
+      run.token = token;
+      run.runId = rid;
+      run.fetches = 0;
+      run.found = null;
+      run.error = '';
+      emitStats();
+      startPoll();
+    }
+    function startPoll() {
+      if (run.polling) return;
+      run.polling = true;
+      run.tries = 0;
+      try { run.timer = setInterval(pollOnce, 6000); } catch (e) {}
+      pollOnce();
+    }
+    function pollOnce() {
+      run.tries++;
+      var token = run.token, rid = run.runId;
+      if (!token || !rid) { stopPoll(); return; }
+      run.fetches++;
+      emitStats();
+      fetch(TRIGGER_API + '/api/v1/runs/' + rid + '/events', {
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
+        credentials: 'omit',
+      }).then(function (res) {
+        if (!res.ok) throw new Error('http-' + res.status);
+        return res.text();
+      }).then(function (text) {
+        run.error = '';
+        var labels = extractLabels(text);
+        if (labels.length) {
+          var name = labels[labels.length - 1];
+          run.found = name;
+          stopPoll();
+          try {
+            window.dispatchEvent(new CustomEvent('knowmodel-run-model', { detail: { name: name, runId: rid, all: labels } }));
+          } catch (e) {}
+        } else if (run.tries >= 30) {
+          run.error = 'timeout';
+          stopPoll();
+        }
+        emitStats();
+      }).catch(function (err) {
+        run.error = String((err && err.message) || err).slice(0, 80);
+        if (run.tries >= 30) stopPoll();
+        emitStats();
+      });
+    }
+    function watchStream(res, url) {
+      // 渐进读 clone 分支找 token（token 在流开头 headers 帧，不能等流结束）。
+      try {
+        var reader = res.clone().body.getReader();
+        var dec = new TextDecoder();
+        var buf = '', bytes = 0, done = false;
+        (function pump() {
+          reader.read().then(function (r) {
+            if (r.done || done) { try { reader.cancel(); } catch (e) {} return; }
+            bytes += r.value ? r.value.length : 0;
+            try { buf += dec.decode(r.value || new Uint8Array(0), { stream: true }); } catch (e) {}
+            if (buf.length < 2 * 1024 * 1024) {
+              var tk = findToken(buf);
+              if (tk) { done = true; acceptToken(tk); try { reader.cancel(); } catch (e) {} return; }
+            }
+            if (bytes > 512 * 1024) { try { reader.cancel(); } catch (e) {} return; }
+            pump();
+          }).catch(function () {});
+        })();
+      } catch (e) {}
+    }
     function loadIds() {
       try {
         var raw = document.documentElement.getAttribute(ATTR);
@@ -312,6 +445,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
+              run: { hasToken: !!run.token, runId: run.runId || '', fetches: run.fetches, found: run.found || '', error: run.error || '' },
             },
           })
         );
@@ -365,12 +499,20 @@
         var url = reqUrl(input);
         return origFetch.apply(this, arguments).then(function (res) {
           try {
+            // token 在流开头：渐进读 clone 分支抢先捕获（不等流结束）。
+            if (!STATIC_EXT_RE.test(url || '') && STREAM_URL_RE.test(url || '')) {
+              try { watchStream(res, url); } catch (e) {}
+            }
             if (looksLikeData(res)) {
               res
                 .clone()
                 .text()
                 .then(function (t) {
                   check(t, url);
+                  if (!run.token) {
+                    var tk = findToken(t);
+                    if (tk) acceptToken(tk);
+                  }
                 })
                 .catch(function () {});
             }
@@ -384,14 +526,46 @@
       XMLHttpRequest.prototype.send = function () {
         var xhr = this;
         try {
+          // 流式 XHR：progress 增量里找 token，不等 load。
+          xhr.addEventListener('progress', function () {
+            try {
+              if (!run.token && typeof xhr.responseText === 'string' && xhr.responseText.length < 2 * 1024 * 1024) {
+                var tk = findToken(xhr.responseText);
+                if (tk) acceptToken(tk);
+              }
+            } catch (e) {}
+          });
           xhr.addEventListener('load', function () {
             try {
-              if (typeof xhr.responseText === 'string') check(xhr.responseText, xhr.responseURL);
+              if (typeof xhr.responseText === 'string') {
+                check(xhr.responseText, xhr.responseURL);
+                if (!run.token) {
+                  var tk = findToken(xhr.responseText);
+                  if (tk) acceptToken(tk);
+                }
+              }
             } catch (e) {}
           });
         } catch (e) {}
         return origSend.apply(this, arguments);
       };
+    } catch (e) {}
+    // 内容脚本的种子 token / 切页重置经 CustomEvent 进来（页面世界单向收）。
+    try {
+      window.addEventListener('knowmodel-run-token-seed', function (ev) {
+        try { acceptToken(ev && ev.detail && ev.detail.token); } catch (e) {}
+      });
+      window.addEventListener('knowmodel-nav-reset', function () {
+        try {
+          stopPoll();
+          run.token = null;
+          run.runId = null;
+          run.fetches = 0;
+          run.found = null;
+          run.error = '';
+          emitStats();
+        } catch (e) {}
+      });
     } catch (e) {}
     emitStats();
   }
@@ -420,9 +594,83 @@
     }
   }
 
+  // 运行轨迹结论（最高权威）：trace 报出的真实模型名直接定论。名字若不在目录里
+  // 也照样展示——trace 是 worker 自己写的，比目录全更重要。
+  async function onRunModel(ev) {
+    try {
+      const name = norm((ev && ev.detail && ev.detail.name) || '');
+      const runId = (ev && ev.detail && ev.detail.runId) || '';
+      if (!name) return;
+      log('run trace model:', name, runId);
+      let cur = null;
+      try {
+        ({ currentChat: cur } = await ext.storage.local.get(['currentChat']));
+      } catch (e) {
+        cur = null;
+      }
+      if (cur && cur.url && cur.url !== location.href) cur = null;
+      if (cur && cur.source === 'run-trace' && cur.models && cur.models.length &&
+          cur.models[0].publicName === name) return;
+      const models = await getStoredModels();
+      let hit = null;
+      const nl = name.toLowerCase();
+      for (const m of models) {
+        if (m && m.publicName && String(m.publicName).toLowerCase() === nl) { hit = m; break; }
+      }
+      const info = hit ? infoOf(hit) : { publicName: name, organization: '', id: 'trace:' + runId, capabilities: [] };
+      const payload = {
+        mode: 'direct',
+        revealed: false,
+        models: [info],
+        source: 'run-trace',
+        url: location.href,
+        updatedAt: Date.now(),
+      };
+      await ext.storage.local.set({ currentChat: payload });
+      KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
+      try {
+        diag.lastRunName = name;
+        diag.lastRunId = runId;
+        await persistDiag();
+      } catch (e) {
+        /* 记账失败继续 */
+      }
+    } catch (e) {
+      diagNote(e, 'onRunModel');
+    }
+  }
+
+  function norm(s) {
+    return String(s == null ? '' : s).trim();
+  }
+
+  // 页面 HTML 里残留的 token（历史流）：喂给页面世界走同一条取证管线。
+  const TOKEN_RE = /public-access-token[^A-Za-z0-9_\-]+(eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,})/;
+  function seedRunToken() {
+    try {
+      const html = (document.documentElement && document.documentElement.outerHTML) || '';
+      const m = TOKEN_RE.exec(html.slice(0, 4 * 1024 * 1024));
+      if (m && m[1]) {
+        log('seed run token from page html');
+        window.dispatchEvent(new CustomEvent('knowmodel-run-token-seed', { detail: { token: m[1] } }));
+      }
+    } catch (e) {
+      diagNote(e, 'seedRunToken');
+    }
+  }
+
+  function notifyPageNavReset() {
+    try {
+      window.dispatchEvent(new CustomEvent('knowmodel-nav-reset'));
+    } catch (e) {
+      /* 页面世界收不到就算了 */
+    }
+  }
+
   try {
     window.addEventListener('knowmodel-net-hit', onNetHit);
     window.addEventListener('knowmodel-snoop-stats', onSnoopStats);
+    window.addEventListener('knowmodel-run-model', onRunModel);
   } catch (e) {
     /* 极端环境跳过 */
   }
@@ -452,6 +700,7 @@
       }
     }
     ensureNetSnoop();
+    seedRunToken();
     const chat = await updateCurrentChat(!models || !models.length, !!force);
     // TEMP-DIAG：记一笔 pipeline 快照
     try {
@@ -503,7 +752,8 @@
       listFoundOnPage = false;
       tries = 0;
       // 切对话了：立刻清零旧结论，别让上一个对话的模型赖在屏幕上；
-      // 新结论由随后几轮扫描（尤其网络首命中）填进来。
+      // 新结论由随后几轮扫描（运行轨迹/网络首命中）填进来。页面世界的轮询也要停。
+      notifyPageNavReset();
       try {
         const reset = { mode: 'unknown', revealed: false, models: [], source: 'none', url: lastHref, updatedAt: Date.now() };
         ext.storage.local.set({ currentChat: reset });

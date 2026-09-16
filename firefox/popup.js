@@ -165,7 +165,7 @@ async function loadChat() {
     box.appendChild(chatEmpty('还没有检测数据：打开一个 arena.ai 对话页，插件会自动识别。'));
     return;
   }
-  const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区', 'page-data': '页面数据', network: '网络请求' };
+  const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区', 'page-data': '页面数据', network: '网络请求', 'run-trace': '运行轨迹' };
   if (cc.mode === 'direct' && cc.models.length) {
     modeEl.textContent = `直接对话（来源：${srcMap[cc.source] || cc.source}）`;
     for (const m of cc.models) box.appendChild(buildRow(m));
@@ -217,6 +217,13 @@ async function loadDiag() {
       '　uuid：' + (st.uuidScanned || 0) + ' 个　命中：' + ((st.idHits || []).join(', ') || '无'),
     '按钮：' + (st.btnCount || 0) + ' 个　嗅探：' +
       (diag.net.ready ? ('存活，响应 ' + diag.net.responses + '，命中 ' + diag.net.hits) : '未注入/被CSP拦截'),
+    '轨迹：' + (function () {
+      const r = (diag.net && diag.net.run) || null;
+      if (!r || !r.hasToken) return '无 token（发一句话后再看）';
+      if (r.found) return '已解析：' + r.found;
+      if (r.error) return '轮询中（' + r.fetches + ' 次），最近：' + r.error;
+      return '轮询中（' + r.fetches + ' 次），runId=' + (r.runId || '?');
+    })(),
   ];
   if (linesEl) linesEl.textContent = rows.join('\n');
   if (msgEl && diag.errors && diag.errors.length) {
