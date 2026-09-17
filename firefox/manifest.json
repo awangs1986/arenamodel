@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ArenaModels — 当前对话模型识别",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "识别 arena.ai 当前可用模型：显示名、厂商与内部 id，点击即复制。",
   "permissions": [
     "storage"
@@ -31,6 +31,17 @@
       ],
       "run_at": "document_start",
       "all_frames": true
+    },
+    {
+      "matches": [
+        "https://arena.ai/*"
+      ],
+      "js": [
+        "snoop.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
     }
   ],
   "action": {
@@ -40,7 +51,7 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "knowmodel@local",
-      "strict_min_version": "109.0"
+      "strict_min_version": "128.0"
     }
   }
 }

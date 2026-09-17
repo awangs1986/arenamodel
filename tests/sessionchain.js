@@ -24,7 +24,7 @@ const recordsWith = (tok) => JSON.stringify({records:[
 ]});
 const recordsEmpty = JSON.stringify({records:[{data:{type:'start',messageId:'m1'},id:'a',seqNum:0}]});
 
-let INJECTED = '';
+const INJECTED = R('snoop.js');
 const sharedStore = {};
 const chatWrites = [];
 async function boot() {
@@ -41,7 +41,7 @@ async function boot() {
     window: null,
     document: { querySelectorAll: () => [], body: {}, title: '',
       documentElement: { outerHTML: '', getAttribute: () => null, setAttribute: () => {}, appendChild: () => {} },
-      createElement: () => ({ set textContent(v){ if (!INJECTED) INJECTED = v; }, get textContent(){ return ''; }, remove(){} }),
+      createElement: () => ({ set textContent(v){}, get textContent(){ return ''; }, remove(){} }),
       getElementById: () => null, head: null },
     setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0, clearTimeout: () => {}, console: console,
     chrome: { storage: { local: {
@@ -93,9 +93,16 @@ function pageWorld(route) {
 }
 
 (async () => {
-  INJECTED = '';
   await boot();
-  assert.ok(INJECTED.includes('fetchSessionRun'), 'payload 有新链');
+  assert.ok(INJECTED.includes('fetchSessionRun'), 'snoop 有新链');
+  // CSP 回归锁：页世界探针必须走 manifest world:MAIN 注册，内容脚本里不许再有内联注入。
+  const contentSrc = R('content.js');
+  assert.ok(!contentSrc.includes('snoopPayload'), '内联注入已移除');
+  assert.ok(!contentSrc.includes("createElement('script')"), '无 script 标签注入');
+  for (const mf of ['extension/manifest.json', 'firefox/manifest.json']) {
+    const m = JSON.parse(fs.readFileSync(mf, 'utf8'));
+    assert.ok((m.content_scripts || []).some((e) => (e.js || []).includes('snoop.js') && e.world === 'MAIN'), mf + ' 注册 MAIN snoop');
+  }
   console.log('0 inject: PASS');
 
   // A. 全链：trigger-token 专线 → records 排水分发 → events → run-model

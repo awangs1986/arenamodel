@@ -227,7 +227,7 @@ async function loadDiag() {
     '页面HTML：' + (st.htmlLen || 0) + ' 字节　目录：' + (st.hasCatalog ? '有' : '无') +
       '　uuid：' + (st.uuidScanned || 0) + ' 个　命中：' + ((st.idHits || []).join(', ') || '无'),
     '按钮：' + (st.btnCount || 0) + ' 个　嗅探：' +
-      (diag.net.ready ? ('存活，响应 ' + diag.net.responses + '，命中 ' + diag.net.hits) : '未注入/被CSP拦截'),
+      (diag.net.ready ? ('存活，响应 ' + diag.net.responses + '，命中 ' + diag.net.hits) : '未注入（插件需 ≥1.1.0 且刷新页面；Firefox 需 ≥128）'),
     '轨迹：' + (function () {
       const r = (diag.net && diag.net.run) || null;
       if (!r || !r.hasToken) {
