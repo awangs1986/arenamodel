@@ -17,7 +17,7 @@
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
-    build: '20260918-slow-poll',
+    build: '20260918-sentinel',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -145,6 +145,14 @@
         url: location.href,
         updatedAt: Date.now(),
       };
+      // Arena agent 模式的选择器常驻内部模型 "test"（默认选中项），不代表
+      // 实际应答模型——/agent/ 页把它当"没找到"，等 run-trace 出真身。
+      try {
+        if (/\/agent\//.test(payload.url) && payload.models.length === 1) {
+          const nm = String((payload.models[0] && payload.models[0].publicName) || '').trim().toLowerCase();
+          if (nm === 'test') { payload.models = []; payload.source = 'none'; }
+        }
+      } catch (eTst) {}
       // 同一 URL 下不降级：本轮没找到但之前已确认过模型（多为网络嗅探结论），
       // 保留旧结论只刷新时间；URL 变了则无条件接受新结论（SPA 切页不留旧数据）。
       // 手动刷新（force）绕过保护：用户点了刷新就是要重认，旧结论再可疑也得让位。
@@ -157,6 +165,20 @@
           !payload.models.length &&
           prev.models &&
           prev.models.length
+        ) {
+          payload = Object.assign({}, prev, { updatedAt: payload.updatedAt });
+        }
+        // run-trace 是终局结论（真实应答模型来自 Arena 自家遥测）——同一
+        // URL 下 DOM 扫描（selector/page-data）不得把它覆盖回选择器默认值
+        // （如 agent 模式常驻的 "test"）。换页（URL 变）或手动 force 才让位；
+        // 新一轮 run-trace 自身仍可覆盖（每轮换模型照常生效）。
+        if (
+          !force &&
+          prev &&
+          prev.url === payload.url &&
+          prev.source === 'run-trace' &&
+          prev.models && prev.models.length &&
+          payload.source !== 'run-trace'
         ) {
           payload = Object.assign({}, prev, { updatedAt: payload.updatedAt });
         }
@@ -305,7 +327,7 @@
     // 会话制正门形态：{"token": "eyJ..."}（键名就是 token，无 access-token 标签）。
     var TOKEN_JSON_RE = /"(?:public-access-token|access-token|token|runToken)"\s*:\s*"(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)"/;
     var REALTIME_BASE = 'https://api.trigger.dev';
-    var run = { token: null, runId: null, sess: null, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqHdrs: [], reqRuns: [], accepts: [], prevSeq: -1, slowMode: false };
+    var run = { token: null, runId: null, sess: null, sessTok: null, sessExp: 0, exp: 0, fetches: 0, found: null, error: '', polling: false, timer: 0, tries: 0, taps: 0, sockMsgs: 0, searchedKB: 0, streams: [], tapLog: [], reqHdrs: [], reqRuns: [], accepts: [], prevSeq: -1, slowMode: false, doneTok: null, procTok: null };
     // 跳过的条目不值得每次都刷诊断（storage 写太频繁）；节流到 2s 一次。
     // 旁路的流由 watchStream 即时 emit，这里只管“跳过”那一侧。
     var lastTapEmit = 0;
@@ -415,6 +437,9 @@
     function acceptToken(token, src) {
       if (!token || typeof token !== 'string') return;
       if (token === run.token) return;
+      // 本轮已处理/在途的 run token 不得当新链（SSE 看门狗会把自家 records
+      // 响应里的 turn-complete token 喂回来，曾致同 run 无限重置-重拉循环）。
+      if (token === run.doneTok || token === run.procTok) return;
       if (!JWT_SHAPE_RE.test(token)) return;
       var rid = runIdFromToken(token);
       var exp = 0;
@@ -435,7 +460,7 @@
       stopPoll();
       run.token = token;
       var sid = sessionIdFromToken(token);
-      if (sid) run.sess = sid;
+      if (sid) { run.sess = sid; run.sessTok = token; run.sessExp = exp; }
       // 原版：rid 解不出时保留旧 runId（同一 run 的续期 token 仍可用）。
       // 会话制例外：新会话 token 配旧 runId 会拿着错钥匙 403，必须清掉走排水分发。
       if (rid) run.runId = rid;
@@ -446,6 +471,11 @@
       run.sessTries = 0;
       run.found = null;
       run.error = '';
+      // 新 token = 新链：上一轮的 doneTok/在途/活性刻度一并清零。
+      run.doneTok = null;
+      run.procTok = null;
+      run.prevSeq = -1;
+      run.slowMode = false;
       emitStats();
       startPoll();
     }
@@ -493,7 +523,9 @@
         done();
         run.error = '';
         var labels = extractLabels(text);
-        if (labels.length) {
+        // 终局去重：处理窗口内的并发 events（慢网/轮询重叠）只有第一个
+        // 回来的能派发——doneTok 一落，同 token 的后来者全部跳过。
+        if (labels.length && token !== run.doneTok) {
           // 同原版：去重后取最后一个（最后一次调用的模型）。
           var uniq = [];
           for (var i = 0; i < labels.length; i++) if (uniq.indexOf(labels[i]) < 0) uniq.push(labels[i]);
@@ -503,16 +535,41 @@
           try {
             window.dispatchEvent(new CustomEvent('knowmodel-run-model', { detail: { name: name, runId: rid, all: uniq } }));
           } catch (e) {}
+          // 哨兵态：一轮处理完不死——记下本轮 run token（下一轮 turn-complete
+          // 与之不同才算新轮），恢复会话 token 回 records 看哨，降频 30s；
+          // 用户再发话（armNextTurn）自动回 6s。每轮换模型也接得住。
+          run.doneTok = token;
+          if (run.sessTok) { run.token = run.sessTok; run.exp = run.sessExp || 0; }
+          run.runId = null;
+          run.tries = 0;
+          run.sessTries = 0;
+          run.slowMode = true;
+          try { run.timer = setInterval(pollOnce, 30000); run.polling = true; } catch (eSn) {}
         } else if (run.tries >= 30) {
-          run.error = 'timeout';
+          run.error = 'no-label';
+          // 事件里没标签：不死停，同样回看哨态降频续命。
+          if (run.sessTok) { run.token = run.sessTok; run.exp = run.sessExp || 0; }
+          run.runId = null;
+          run.tries = 0;
+          run.slowMode = true;
           stopPoll();
+          try { run.timer = setInterval(pollOnce, 30000); run.polling = true; } catch (eSn2) {}
         }
         emitStats();
       }).catch(function (err) {
         done();
         var msg = String((err && err.name === 'AbortError') ? 'timeout-20s' : ((err && err.message) || err));
         run.error = msg.slice(0, 80);
-        if (run.tries >= 30) { stopPoll(); rescueToken(); }
+        if (run.tries >= 30) {
+          // 事件路连败 30 次：回看哨态降频续命，别死。
+          if (run.sessTok) { run.token = run.sessTok; run.exp = run.sessExp || 0; }
+          run.runId = null;
+          run.tries = 0;
+          run.slowMode = true;
+          stopPoll();
+          try { run.timer = setInterval(pollOnce, 30000); run.polling = true; } catch (eSn3) {}
+          rescueToken();
+        }
         emitStats();
       });
     }
@@ -600,7 +657,9 @@
           } catch (e2) {}
         }
         var rid2 = lastTok ? runIdFromToken(lastTok) : null;
-        if (lastTok && rid2) {
+        if (lastTok && rid2 && lastTok !== run.doneTok && lastTok !== run.procTok) {
+          // procTok 在途去重：异步 events 没回来前，同轮的并发 poll 不重入。
+          run.procTok = lastTok;
           run.token = lastTok;
           run.runId = rid2;
           try { run.accepts.push({ t: Date.now(), src: 'records', rid: rid2 }); if (run.accepts.length > 8) run.accepts.shift(); } catch (eA2) {}
@@ -619,9 +678,9 @@
           emitStats();
           rescueToken();
         } else {
-          // 本轮还没 turn-complete（空对话/刚发送）：3 次内 2s 快排，之后转
-          // 6s 慢轮直到 30 次——“切到空对话后才发话”也能等到，不早停。
-          run.error = run.sessTries >= 3 ? 'waiting-run' : '';
+          // 还没 turn-complete（空对话/agent 在跑），或本轮已处理/在途
+          // （doneTok/procTok 相同 = 哨兵态）：继续等下一轮。
+          run.error = (lastTok && (lastTok === run.doneTok || lastTok === run.procTok)) ? 'armed' : (run.sessTries >= 3 ? 'waiting-run' : '');
           emitStats();
           if (run.sessTries < 3) {
             try { setTimeout(function () { if (run.polling) pollOnce(); }, 2000); } catch (e4) {}
@@ -634,6 +693,20 @@
         if (run.tries >= 30) { stopPoll(); rescueToken(); }
         emitStats();
       });
+    }
+    // 用户发新话（/in/append）或 SPA 重开 /out 流：提速盯新一轮的 turn-complete。
+    // 每轮换模型就靠它——哨兵态被这条事件唤回 6s 快轮，新一轮一完成即识别。
+    function armNextTurn() {
+      try {
+        if (!run.sessTok || !run.sess) return;
+        run.tries = 0;
+        run.sessTries = 0;
+        run.slowMode = false;
+        run.error = '';
+        stopPoll();
+        try { run.timer = setInterval(pollOnce, 6000); run.polling = true; } catch (eAn) {}
+        pollOnce();
+      } catch (eT) {}
     }
     // 主动取 token：会话制下 token 按会话缓存，后几轮页面不再请求正门，
     // 等是等不来的；页面 cookie 还在，自己 GET 一次即可（幂等、无副作用）。
@@ -823,7 +896,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260918-slow-poll', hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260918-sentinel', hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -927,6 +1000,8 @@
           if (run.reqHdrs.length > 12) run.reqHdrs.shift();
         }
         if (hit && tokenHasRunScope(hit)) acceptToken(hit, 'hdr:' + hitName);
+        // 新一轮触发器：发话（in/append）或重开 SSE（/out 结尾，排除自家 /out/records）。
+        if (/\/in\/append/i.test(su) || /\/out(\?|$)/i.test(su)) { try { armNextTurn(); } catch (eT2) {} }
       } catch (e) {}
     }
     try {
@@ -1012,10 +1087,20 @@
       var XHP = XMLHttpRequest.prototype;
       // 防重包：同学原版，重复注入不再叠加监听器。
       if (XHP && XHP.send && !XHP.send.__kmpWrapped) {
+      try {
+        if (XHP.open && !XHP.open.__kmpWrapped) {
+          var origOpen = XHP.open;
+          var kmpOpen = function (m, u) { try { this.__kmpUrl = String(u || ''); } catch (eO) {} return origOpen.apply(this, arguments); };
+          kmpOpen.__kmpWrapped = true;
+          XHP.open = kmpOpen;
+        }
+      } catch (eOw) {}
       var origSend = XHP.send;
       var kmpSend = function () {
         var xhr = this;
         try {
+          // XHR 形态的发话/重开流同样触发新一轮看哨。
+          if (/\/in\/append/i.test(String(xhr.__kmpUrl || '')) || /\/out(\?|$)/i.test(String(xhr.__kmpUrl || ''))) { try { armNextTurn(); } catch (eT3) {} }
           // 流式 XHR：progress 增量里找 token，不等 load。
           xhr.addEventListener('progress', function () {
             try {
