@@ -22,6 +22,8 @@ Two ways to use, same engine underneath:
 - **Browser extension (recommended, zero dependency):** `extension/` for Chrome/Edge, `firefox/` for Firefox.
   Load unpacked → open `arena.ai` → click the toolbar icon. Besides the full model list with search,
   the popup header and a badge at the page corner show **which model the current chat is using**.
+  Note: after updating the extension, reload all `arena.ai` tabs — the page-world probe script
+  is not hot-swapped, so stale tabs keep running the old build.
 - **Python version:** CLI + FastAPI query service exposing an OpenAI-style `/api/v1/models`.
 
 The repo ships a real snapshot in `models.json` (1066 raw / 315 valid entries as of 2026-09-16), so `list` works out of the box.
@@ -45,11 +47,26 @@ The repo ships a real snapshot in `models.json` (1066 raw / 315 valid entries as
    **before voting the identities are genuinely unknowable** — the server never sends them to the frontend,
    so the UI honestly reports "in battle, identities hidden". After the reveal, both names are captured
    from the result text (a `MutationObserver` re-checks the DOM as streaming/voting mutates it).
-   Agent pages (`/agent/xxx`, no model switcher) are covered by scanning embedded page data
-   and API responses for known internal model ids (`page-data` / `network` sources).
-5. **Validity filter.** Only entries with a `text` / `search` / `image` output capability **and** an
+5. **Agent pages (`/agent/xxx`): the run-trace chain — Arena's own telemetry tells the truth.**
+   Agent chats have no model switcher and never name their model in the DOM, but every turn flows
+   through Trigger.dev realtime sessions carrying a `public-access-token` JWT (scope
+   `read:runs:<runId>` / `read/write:sessions:<sessionId>`). The extension harvests that token from
+   whichever carrier is active — response-stream header frames, the SPA's own `/api/chat/trigger-token`
+   responses, request `Authorization` headers, or the paired `turn-complete` + `public-access-token`
+   records on `/out/records` — then reads the run's trace (direct `api.trigger.dev` or the same-origin
+   `/ai-proxy/` mirror) and picks the cube-icon labels inside the `ai.streamText.doStream` span:
+   the internal model ids the worker actually ran (source badge: "run trace"). Each turn gets its own
+   token/run, so **per-turn model switches are tracked automatically**; a run-trace verdict cannot be
+   overwritten by DOM/button findings within the same turn. Page-data scanning and network sniffing
+   stay as auxiliary evidence. (Needs at least one message sent in the page; not supported in Python.)
+6. **Self-healing token chain.** The front-gate route keeps flip-flopping between deploys
+   (`trigger-token` was 403'd, later returned; `/api/me/pulse` once carried a token, then stopped),
+   so the snoop knocks both doors on rescue, rejects expired tokens on arrival, never lets a stale
+   token block a fresh one, and slow-polls indefinitely instead of giving up. The popup ships a
+   one-click diagnostic export (full JSON state: taps, request headers, streams, errors).
+7. **Validity filter.** Only entries with a `text` / `search` / `image` output capability **and** an
    `organization` are shown — this drops internal `stealth` placeholders, matching the original `list_models`.
-6. **Name → id mapping.** The `publicName → internal id` lookup (`resolve` / `/lookup`) is exactly the
+8. **Name → id mapping.** The `publicName → internal id` lookup (`resolve` / `/lookup`) is exactly the
    step the original project performs to find `modelAId` before calling `chat/completions`.
 
 ### Usage
@@ -108,6 +125,7 @@ src/main.py        CLI entry point
 
 - **浏览器插件（推荐，零依赖）**：`extension/` 给 Chrome/Edge，`firefox/` 给 Firefox。
   解压加载 → 打开 `arena.ai` → 点工具栏图标。除了带搜索的完整模型列表，弹窗顶部和页面右下角还会显示**当前对话正在用的模型**。
+  注意：更新扩展后请刷新所有 `arena.ai` 标签页——已注入页面的探测脚本不会热替换，旧标签页会继续跑旧版逻辑。
 - **Python 版**：CLI + FastAPI 查询服务，对外是 OpenAI 风格的 `/api/v1/models`。
 
 仓库自带一份真实抓取快照 `models.json`（2026-09-16：1066 原始 / 315 有效），`list` 开箱就有数据。
@@ -126,14 +144,23 @@ src/main.py        CLI entry point
    （精确命中优先，其次最长名字包含匹配）。匿名对战靠投票按钮判定（"A is better" / "Tie" / "Both are bad"）：
    **投票前双方身份是真的看不到**——服务器根本不下发到前端，所以界面会如实显示"对战中、身份未公开"；
    揭晓后从结果文本捕获双方名字（`MutationObserver` 在流式输出/投票改 DOM 时去抖重检）。
-   Agent 页（/agent/xxx，无模型切换器）走运行轨迹链（学自原项目 `arena-model-probe.inject.js` 的 runmodel 模块）：
-   响应流 headers 帧里的 `public-access-token`（JWT，scope 含 `read:runs:<runId>`）→ 读该 run 在 Trigger.dev
-   上的 trace → `ai.streamText.doStream` span 里图标为 cube 的标签即 worker 写入的真实模型名
-   （来源标为[运行轨迹]；需页面发过至少一条消息，轮询最多约 3 分钟。Python 版不支持，匿名抓取加载不出 agent 对话）
-   ——页面脚本里的模型 id 名单（≥3 个命中判存疑）与网络嗅探作为辅助证据。
-5. **有效性过滤。** 只展示有 `text` / `search` / `image` 输出能力**且**有 `organization` 的项——
+5. **Agent 页（/agent/xxx，无模型切换器）：运行轨迹链——Arena 自家遥测里藏着真身**
+   （学自原项目 `arena-model-probe.inject.js` 的 runmodel 模块）。Agent 对话的 DOM 里永远不出现模型名，
+   但每轮回答都流经 Trigger.dev 实时会话，token 藏在四条载体里任一条：响应流 headers 帧里的
+   `public-access-token`（JWT，scope 含 `read:runs:<runId>` 或 `read/write:sessions:<sessionId>`）、
+   SPA 自己的 `/api/chat/trigger-token` 响应、请求侧 `Authorization` 头、
+   `/out/records` 里 `turn-complete` + `public-access-token` 成对记录——拿到后读该 run 在
+   Trigger.dev 上的 trace（直连或走同源 `/ai-proxy/` 镜像均可），取 `ai.streamText.doStream`
+   span 里图标为 cube 的标签，即 worker 实际执行用的内部模型 id（来源标为「运行轨迹」，
+   同轮的终局结论，DOM/按钮结论不覆盖它）。每轮各拿各的 token/run，
+   **Arena 每轮换模型也能轮轮跟上**。页面脚本里的模型 id 名单（≥3 个命中判存疑）与网络嗅探作为辅助证据。
+   （需页面发过至少一条消息；Python 版不支持该链路，匿名抓取加载不出 agent 对话。）
+6. **自愈的 token 链。** 正门路由在部署间反复横跳（trigger-token 曾 403 又复活；pulse 曾带 token 又撤空），
+   自救时两扇门都敲（先 trigger-token、pulse 兜底），过期 token 入场即拒收、绝不占槽挡住新鲜 token，
+   慢轮询不死（等到终局为止）。弹窗内置一键复制诊断 JSON（taps、请求头、流、错误全量状态）。
+7. **有效性过滤。** 只展示有 `text` / `search` / `image` 输出能力**且**有 `organization` 的项——
    滤掉内部 `stealth` 占位模型，与原项目 `list_models` 一致。
-6. **显示名 → 内部 id 映射。** `resolve` / `/lookup` 这一步，正是原项目调 `chat/completions` 之前找 `modelAId` 的那一步。
+8. **显示名 → 内部 id 映射。** `resolve` / `/lookup` 这一步，正是原项目调 `chat/completions` 之前找 `modelAId` 的那一步。
 
 ### 用法
 

@@ -28,11 +28,16 @@
 
 - **直接对话**：显示正在用的模型（名 / 厂商 / 内部 id，点击复制），并标注来源
   （链接参数、页面选择器、页面数据、网络请求）。
-- **Agent 页**（/agent/xxx，无模型切换器）：走运行轨迹链——响应流 headers
-  帧里的 `public-access-token`（JWT，scope 含 `read:runs:<runId>`）→ 读该 run
-  在 Trigger.dev 上的 trace → `ai.streamText.doStream` span 里图标为 cube 的标签
-  就是 worker 写入的真实模型名，来源标为「运行轨迹」。需页面发过至少一条消息
-  （token 随流下发）；轮询最多约 3 分钟，弹窗诊断区有「轨迹」行可看进度。
+- **Agent 页**（/agent/xxx，无模型切换器）：走运行轨迹链——token 从四条载体任一条收割
+  （响应流 headers 帧的 `public-access-token`、SPA 自己的 `/api/chat/trigger-token` 响应、
+  请求侧 `Authorization` 头、`/out/records` 里 `turn-complete` 成对记录），再读该 run 在
+  Trigger.dev 上的 trace（直连或同源 `/ai-proxy/` 镜像）→ `ai.streamText.doStream` span 里
+  图标为 cube 的标签就是 worker 写入的真实模型名，来源标为「运行轨迹」，同轮终局，
+  DOM/按钮结论不覆盖。每轮各拿各的 token/run，**Arena 每轮换模型也轮轮跟上**。需页面发过
+  至少一条消息；慢轮询不死（等到终局为止），弹窗诊断区有「轨迹」行可看进度，
+  一键复制诊断 JSON 可全量取证。正门反复横跳（trigger-token 曾 403 又复活、pulse 曾带
+  token 又撤空），自救两门都敲，过期 token 不占槽。**更新扩展后请刷新所有 arena.ai
+  标签页**——已注入页面的探测脚本不会热替换，旧标签页会继续跑旧版逻辑。
 - **匿名对战**：投票前服务器根本不下发身份，前端无从得知——如实显示
   「匿名对战中」，投票揭晓渲染进页面后自动捕获双方名字。
 - **首页 / 榜单页**：显示「没检测到对话」，去开一个对话再回来。
