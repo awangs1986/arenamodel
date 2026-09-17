@@ -17,7 +17,7 @@
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
-    build: '20260918-sentinel',
+    build: '20260919-dual-gate',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -722,18 +722,26 @@
       directTries++;
       tokenFetching = true;
       try {
-        // trigger-token 已被 403 封路（Route not allowed）；自救也走新门
-        // /api/me/pulse（SPA 自己在用，响应 {"token": …} 会话 JWT）。
-        fetch('/api/me/pulse', { credentials: 'same-origin' }).then(function (res) {
-          tokenFetching = false;
-          if (!res || !res.ok) return null;
-          return res.text();
-        }).then(function (t) {
+        // 正门形态反复横跳：trigger-token 曾 403（Route not allowed）、pulse 曾
+        // 带 token 又撤（{"pulse":97,…}）。2026-09-17 实测 trigger-token 复活
+        // （200+{"token":…}）。自救两扇门都敲：先 trigger-token，pulse 兜底。
+        function deliver(t, src) {
           try {
+            tokenFetching = false;
             if (!t || (!force && run.token)) return;
             var mm = TOKEN_JSON_RE.exec(t);
-            if (mm && mm[1]) acceptToken(mm[1], 'self');
-          } catch (e) {}
+            if (mm && mm[1]) acceptToken(mm[1], 'self:' + src);
+          } catch (e) { try { tokenFetching = false; } catch (e2) {} }
+        }
+        fetch('/api/chat/trigger-token', { credentials: 'same-origin' }).then(function (res) {
+          return (res && res.ok) ? res.text() : '';
+        }).catch(function () { return ''; }).then(function (t1) {
+          var m1 = null;
+          try { m1 = TOKEN_JSON_RE.exec(t1 || ''); } catch (e) {}
+          if (m1 && m1[1]) { deliver(t1, 'trig'); return; }
+          return fetch('/api/me/pulse', { credentials: 'same-origin' }).then(function (res2) {
+            return (res2 && res2.ok) ? res2.text() : '';
+          }).catch(function () { return ''; }).then(function (t2) { deliver(t2, 'pulse'); });
         }).catch(function () { try { tokenFetching = false; } catch (e) {} });
       } catch (e) { try { tokenFetching = false; } catch (e2) {} }
     }
@@ -896,7 +904,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260918-sentinel', hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260919-dual-gate', hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -1048,7 +1056,8 @@
                       // 下次诊断直接看到它到底返回了什么形状。
                       entry.bs = String(tt || '').slice(0, 140).replace(/ey[A-Za-z0-9_\-]{6,}/g, function (s) { return 'eyJ…(' + s.length + ')'; });
                     }
-                    if (run.token) return;
+                    // 不因槽里有 token 就拒收：旧 token 过期/死锁时，SPA 拿到的新鲜
+                    // 正门 token 必须能进（acceptToken 内部有同值/已处理/过期守卫）。
                     var mm = TOKEN_JSON_RE.exec(tt || '');
                     if (mm && mm[1]) { acceptToken(mm[1], 'resp:' + (/pulse/i.test(url) ? 'pulse' : 'trig')); return; }
                     var bare = String(tt || '').trim();
