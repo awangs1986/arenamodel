@@ -1,4 +1,4 @@
-# knowmodel 浏览器插件
+# ArenaModels 浏览器插件
 
 零依赖的「可运行界面」（Chrome / Edge 用本目录，Firefox 用 `../firefox/`，两边逻辑文件完全相同）：用户正常打开 `arena.ai` 即已通过 Cloudflare，
 插件直接从页面里提取模型列表，不需要 Python、不需要另起浏览器。

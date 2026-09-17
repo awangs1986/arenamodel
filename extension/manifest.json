@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "knowmodel — arena.ai 模型识别",
+  "name": "ArenaModels — 当前对话模型识别",
   "version": "1.0.0",
   "description": "识别 arena.ai 当前可用模型：显示名、厂商与内部 id，点击即复制。",
   "permissions": ["storage"],

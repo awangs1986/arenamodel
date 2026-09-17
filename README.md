@@ -1,4 +1,4 @@
-# KnowModel —— 识别 arena.ai 当前对话用的是哪个模型
+# ArenaModels —— 识别 arena.ai 当前对话用的是哪个模型
 
 **[English](#english)** | **[中文说明](#中文说明)** · snoop build `20260921-same-run-noreset` · 回归 40 场景全绿
 

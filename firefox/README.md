@@ -1,4 +1,4 @@
-# knowmodel Firefox 版
+# ArenaModels Firefox 版
 
 与 Chrome 版共用同一套逻辑文件（`ext.js` / `model-utils.js` / `detector.js` /
 `models-scan.js` / `badge.js` / `content.js` / `popup.js` /
