@@ -3,15 +3,32 @@
   "name": "knowmodel — arena.ai 模型识别",
   "version": "1.0.0",
   "description": "识别 arena.ai 当前可用模型：显示名、厂商与内部 id，点击即复制。",
-  "permissions": ["storage"],
-  "host_permissions": ["https://arena.ai/*"],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://arena.ai/*"
+  ],
   "background": {
-    "scripts": ["ext.js", "background.js"]
+    "scripts": [
+      "ext.js",
+      "background.js"
+    ]
   },
   "content_scripts": [
     {
-      "matches": ["https://arena.ai/*"],
-      "js": ["ext.js", "model-utils.js", "detector.js", "models-scan.js", "badge.js", "content.js"],
+      "matches": [
+        "https://arena.ai/*"
+      ],
+      "js": [
+        "ext.js",
+        "model-utils.js",
+        "evidence.js",
+        "detector.js",
+        "models-scan.js",
+        "badge.js",
+        "content.js"
+      ],
       "run_at": "document_start",
       "all_frames": true
     }

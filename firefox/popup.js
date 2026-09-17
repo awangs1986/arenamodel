@@ -165,12 +165,23 @@ async function loadChat() {
     box.appendChild(chatEmpty('还没有检测数据：打开一个 arena.ai 对话页，插件会自动识别。'));
     return;
   }
-  const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区', 'page-data': '页面数据', network: '网络请求', 'run-trace': '运行轨迹' };
+  const srcMap = { url: '链接', selector: '页面选择器', reveal: '投票揭晓', 'vote-buttons': '投票区', 'page-data': '页面数据', network: '网络请求', 'run-trace': '运行轨迹', fingerprint: '协议指纹', archive: '学习档案', probe: '行为探针', codename: '代号解析' };
+  function kindTag(cc) {
+    if (!cc || !cc.kind) return '';
+    if (cc.kind === 'resolved') return ' · 定案' + (typeof cc.confidence === 'number' ? ' ' + Math.round(cc.confidence * 100) + '%' : '');
+    if (cc.kind === 'inferred') return ' · 推断' + (typeof cc.confidence === 'number' ? ' ' + Math.round(cc.confidence * 100) + '%' : '') + '（具体版本未暴露）';
+    return ' · 未识别';
+  }
   if (cc.mode === 'direct' && cc.models.length) {
-    modeEl.textContent = `直接对话（来源：${srcMap[cc.source] || cc.source}）`;
+    modeEl.textContent = `直接对话（来源：${srcMap[cc.source] || cc.source}${kindTag(cc)}）`;
     for (const m of cc.models) box.appendChild(buildRow(m));
+    if (cc.verdictLabel && cc.kind === 'inferred') box.appendChild(chatEmpty('判定：' + cc.verdictLabel));
+    if (cc.codename && (cc.codename.hints || []).length) {
+      const hints = cc.codename.anonymous ? ['盲测匿名槽位，身份不可知'] : cc.codename.hints;
+      box.appendChild(chatEmpty('代号线索：' + hints.join(' / ')));
+    }
   } else if (cc.mode === 'battle' && cc.revealed && cc.models.length) {
-    modeEl.textContent = '匿名对战 · 已揭晓';
+    modeEl.textContent = '匿名对战 · 已揭晓' + kindTag(cc);
     for (const m of cc.models) box.appendChild(buildRow(m));
   } else if (cc.mode === 'battle') {
     modeEl.textContent = '匿名对战中';
@@ -247,17 +258,62 @@ async function loadDiag() {
 
 $('#copyDiag').addEventListener('click', async () => {
   try {
-    const r = await ext.storage.local.get(['knowmodelDiag', 'currentChat', 'models']);
+    const r = await ext.storage.local.get(['knowmodelDiag', 'currentChat', 'models', 'knowmodelLearned', 'knowmodelProbeOn']);
     const pack = {
       exportedAt: new Date().toISOString(),
       modelsCached: Array.isArray(r.models) ? r.models.length : 0,
       currentChat: r.currentChat || null,
       diag: r.knowmodelDiag || null,
+      learned: r.knowmodelLearned || null,
+      probeOn: !!(r && r.knowmodelProbeOn),
     };
     const ok = await copyText(JSON.stringify(pack, null, 1));
     toast(ok ? '诊断信息已复制，发给开发者即可' : '复制失败');
   } catch (e) {
     toast('复制失败：' + e.message);
+  }
+});
+
+$('#toggleProbe').addEventListener('click', async () => {
+  try {
+    const r = await ext.storage.local.get(['knowmodelProbeOn']);
+    const next = !(r && r.knowmodelProbeOn);
+    await ext.storage.local.set({ knowmodelProbeOn: next });
+    $('#toggleProbe').textContent = next ? '行为探针：开' : '行为探针：关';
+    toast(next ? '行为探针已开：仅活跃对话发形状探针，结论只作低权重推断' : '行为探针已关');
+  } catch (e) {
+    toast('切换失败：' + e.message);
+  }
+});
+
+$('#copyArchive').addEventListener('click', async () => {
+  try {
+    const r = await ext.storage.local.get(['knowmodelLearned']);
+    const ok = await copyText(JSON.stringify(r && r.knowmodelLearned ? r.knowmodelLearned : { entries: [] }, null, 1));
+    toast(ok ? '学习档案已复制' : '复制失败');
+  } catch (e) {
+    toast('复制失败：' + e.message);
+  }
+});
+
+$('#clearArchive').addEventListener('click', async () => {
+  try {
+    await ext.storage.local.remove(['knowmodelLearned']);
+    try { localStorage.removeItem('knowmodel.learned.v1'); } catch (e2) {}
+    toast('学习档案已清除，下次识别重建');
+  } catch (e) {
+    toast('清除失败：' + e.message);
+  }
+});
+
+$('#sendProbe').addEventListener('click', async () => {
+  try {
+    const r = await ext.storage.local.get(['knowmodelProbeOn']);
+    if (!(r && r.knowmodelProbeOn)) { toast('先打开行为探针开关'); return; }
+    await ext.storage.local.set({ knowmodelProbeFire: Date.now() });
+    toast('已请求发送探针（页面需处于活跃对话）');
+  } catch (e) {
+    toast('发送失败：' + e.message);
   }
 });
 

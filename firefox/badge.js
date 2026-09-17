@@ -3,8 +3,17 @@ var KnowModelBadge = (() => {
   'use strict';
 
   function textFor(cc) {
-    if (!cc || cc.mode === 'unknown' || !cc.models) return 'knowmodel：未检测到对话';
-    if (cc.mode === 'direct' && cc.models.length) return '当前模型：' + cc.models[0].publicName;
+    if (!cc || cc.mode === 'unknown' || !cc.models) {
+      if (cc && cc.kind === 'inferred' && cc.family) return '疑似' + cc.family + '系？';
+      if (cc && cc.kind === 'inferred' && cc.verdictLabel) return cc.verdictLabel;
+      return 'knowmodel：未检测到对话';
+    }
+    if (cc.mode === 'direct' && cc.models.length) {
+      const nm = cc.models[0].publicName;
+      if (cc.kind === 'inferred') return '疑似：' + (cc.family ? cc.family + '系？' : nm);
+      if (cc.kind === 'resolved' && typeof cc.confidence === 'number') return '当前模型：' + nm;
+      return '当前模型：' + nm;
+    }
     if (cc.mode === 'battle') {
       if (cc.revealed && cc.models.length) {
         return '揭晓：' + cc.models.map((m) => m.publicName).join(' vs ');

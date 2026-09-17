@@ -23,9 +23,20 @@ const recordsWith = (tok) => JSON.stringify({records:[
 const recordsEmpty = JSON.stringify({records:[{data:{type:'start',messageId:'m1'},id:'a',seqNum:0}]});
 
 let INJECTED = '';
+const sharedStore = {};
+const chatWrites = [];
 async function boot() {
-  const store = {};
+  const store = new Proxy(sharedStore, {
+    set(t, k, v) {
+      t[k] = v;
+      if (k === 'currentChat' && v && typeof v === 'object') {
+        try { chatWrites.push(JSON.parse(JSON.stringify(v))); } catch (e) {}
+      }
+      return true;
+    },
+  });
   const sb = { URL: URL, location: { href: 'https://arena.ai/agent/xxx' },
+    window: null,
     document: { querySelectorAll: () => [], body: {}, title: '',
       documentElement: { outerHTML: '', getAttribute: () => null, setAttribute: () => {}, appendChild: () => {} },
       createElement: () => ({ set textContent(v){ INJECTED += v; }, get textContent(){ return ''; }, remove(){} }),
@@ -37,12 +48,13 @@ async function boot() {
       onChanged: { addListener(){} } },
       runtime: { onMessage: { addListener(){} }, sendMessage: async () => ({}), getURL: (p) => p } },
     fetch: async () => ({ text: async () => '' }) };
-  sb.window = { addEventListener: () => {}, dispatchEvent: () => true, top: null, self: null };
+  const bootEvs = [];
+  sb.window = { addEventListener: (t, fn) => { sb['boot_' + t] = fn; }, dispatchEvent: (e) => { bootEvs.push(e); try { const fn = sb['boot_' + e.type]; if (fn) fn(e); } catch (err) {} return true; }, top: null, self: null };
   sb.window.self = sb.window; sb.window.top = sb.window;
-  sb.CustomEvent = class { constructor(t){ this.type = t; } };
+  sb.CustomEvent = class { constructor(t, o){ this.type = t; this.detail = (o && o.detail) || {}; } };
   sb.MutationObserver = class { observe(){} disconnect(){} };
   vm.createContext(sb);
-  for (const f of ['ext.js','model-utils.js','detector.js','models-scan.js','badge.js','content.js']) vm.runInContext(R(f), sb);
+  for (const f of ['ext.js','model-utils.js','evidence.js','detector.js','models-scan.js','badge.js','content.js']) vm.runInContext(R(f), sb);
   await sleep(120);
   return sb;
 }
@@ -358,5 +370,49 @@ function pageWorld(route) {
     assert.strictEqual(st.sess, SID2.slice(0, 8), 'P 新鲜正门 token 换进来了: ' + JSON.stringify({sess: st.sess, accepts: st.accepts}));
     assert.ok((st.accepts || []).some((a) => a.src === 'resp:trig'), 'P 来源=resp:trig: ' + JSON.stringify(st.accepts));
     console.log('P stale-slot fresh-token swap: PASS');
+  }
+
+  // AD. 融合落盘（内容世界真调用）：run.trace 证据 + updateCurrentChat →
+  // 定案 resolved 落盘，旧形状字段保留。
+  // 注：内容脚本是 IIFE，内部函数不外露；经页面事件缝驱动整条管线。
+  {
+    const b = await boot();
+    const runInBoot = (src) => vm.runInContext(src, b);
+    sharedStore.models = [{ publicName: 'Qwen3P8-27B', organization: 'fireworks', id: 'accounts/fireworks/models/qwen3p8-27b', capabilities: { outputCapabilities: { text: true } } }];
+    // 页面事件 → 内容脚本监听 → 进池（knowmodel-evidence），与真实页面同路
+    runInBoot(`window.__kmpTest.evidence([{ source: 'run.trace.model', weight: 1.00, modelId: 'accounts/fireworks/models/qwen3p8-27b', detail: 'run run_AD' }])`);
+    // 证据进池只是"原料"：内容脚本的轻/深扫描（updateCurrentChat）在测试沙盒里
+    // 读不到 DOM，无结论可融合。本段直接走融合落盘入口断言判定数学与落盘形状。
+    const cc = await runInBoot(`window.__kmpTest.fuse({ mode: 'direct', revealed: false, models: [{ publicName: 'accounts/fireworks/models/qwen3p8-27b', organization: '', id: 'trace:AD', capabilities: [] }], source: 'run-trace', url: 'https://arena.ai/agent/AD', updatedAt: Date.now() })`);
+    assert.ok(cc && cc.kind === 'resolved' && cc.confidence >= 0.9, 'AD 融合定案: ' + JSON.stringify(cc && {kind: cc.kind, confidence: cc.confidence, source: cc.source}));
+    assert.ok(Array.isArray(cc.evidence) && cc.evidence.some((e) => e.source === 'run.trace.model'), 'AD 证据有 trace');
+    assert.ok(cc.url && cc.updatedAt && cc.mode, 'AD 旧形状保留: ' + JSON.stringify({mode: cc.mode, source: cc.source}));
+    console.log('AD fused verdict stored: PASS');
+  }
+
+  // AE. 档案回填（内容世界真调用）：run-trace 源 fuseAndEmit → 定案写入档案
+  {
+    const b = await boot();
+    const runInBoot = (src) => vm.runInContext(src, b);
+    delete sharedStore.knowmodelLearned;
+    // run-trace 落盘经 knowmodel-run-model 事件（内容脚本 onRunModel 真监听）
+    runInBoot(`window.__kmpTest.runModel('accounts/fireworks/models/qwen3p8-27b', 'run_AE')`);
+    await sleep(50);
+    const learned = sharedStore.knowmodelLearned;
+    const has = learned && learned.entries && learned.entries.some((e) => e.verified && (e.modelIds || []).some((m) => /qwen3p8-27b/.test(m)));
+    assert.ok(has, 'AE 定案写入档案: ' + JSON.stringify(learned && learned.entries && learned.entries.length));
+    const cc = sharedStore.currentChat;
+    assert.ok(cc && cc.kind === 'resolved', 'AE 落盘定案: ' + JSON.stringify(cc && cc.kind));
+    console.log('AE archive backfill: PASS');
+  }
+
+  // AF. 推断路径：无证据 → unknown 但形状完整、不崩（经同一 fuse 入口）
+  {
+    const b = await boot();
+    const runInBoot = (src) => vm.runInContext(src, b);
+    await runInBoot(`window.__kmpTest.fuse({ mode: 'unknown', revealed: false, models: [], source: 'none', url: 'https://arena.ai/', updatedAt: Date.now() })`);
+    const cc = sharedStore.currentChat;
+    assert.ok(cc && typeof cc.kind === 'string' && Array.isArray(cc.evidence), 'AF 形状安全: ' + JSON.stringify(cc && {kind: cc.kind, ev: cc.evidence && cc.evidence.length}));
+    console.log('AF inferred-path safe: PASS');
   }
 })().catch((e) => { console.error('FAIL:', e && e.stack || e); process.exit(1); });

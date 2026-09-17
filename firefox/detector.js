@@ -154,6 +154,29 @@ var KnowModelDetector = (() => {
     return hits.slice(0, 2).map((h) => idx.byExact[h.name]);
   }
 
+  // 正文里的裸 id 提及（未知目录名 / accounts/*/models/* 形状）：indicator 证据，
+  // 由融合层做代号解析与档案命中，不直接下结论。
+  function scanModelMentions(bodyText, idx) {
+    const out = [];
+    if (!bodyText) return out;
+    const seen = Object.create(null);
+    try {
+      const shape = /\baccounts\/[a-z0-9_-]+\/models\/[a-z0-9][a-z0-9._-]{1,80}/gi;
+      let m;
+      while ((m = shape.exec(bodyText)) && out.length < 6) {
+        const v = m[0];
+        if (!seen[v]) { seen[v] = true; out.push({ name: v }); }
+      }
+    } catch (e) {}
+    try {
+      for (const name of Object.keys(idx.byExact)) {
+        if (name.length < 4 || out.length >= 6) continue;
+        if (!seen[name] && bodyText.indexOf(name) !== -1) { seen[name] = true; out.push({ name: name }); }
+      }
+    } catch (e2) {}
+    return out;
+  }
+
   var UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 
   // agent 页等无模型选择器的页面：全页搜已知的模型内部 id（UUID 碰撞概率≈0，命中即强信号）。
@@ -253,25 +276,32 @@ var KnowModelDetector = (() => {
       }
       return { mode: 'battle', revealed: false, models: [], source: 'vote-buttons' };
     }
+    const indicators = [];
     const fromUrl = detectFromUrl(url, idx);
-    if (fromUrl) return { mode: 'direct', revealed: false, models: [toInfo(fromUrl.model)], source: 'url' };
+    if (fromUrl) return { mode: 'direct', revealed: false, models: [toInfo(fromUrl.model)], source: 'url', indicators: indicators };
     const fromSel = detectFromSelector(doc, idx);
-    if (fromSel) return { mode: 'direct', revealed: false, models: [toInfo(fromSel.model)], source: 'selector' };
+    for (const hit of scanModelMentions(bodyTextOf(doc), idx)) {
+      indicators.push({ signal: 'mention:' + hit.name, value: hit.name });
+    }
+    if (fromSel) {
+      indicators.push({ signal: 'selector', value: String(fromSel.model && (fromSel.model.publicName || fromSel.model.id) || '') });
+      return { mode: 'direct', revealed: false, models: [toInfo(fromSel.model)], source: 'selector', indicators: indicators };
+    }
     if (opts && opts.deep) {
       const idHits = findKnownIds(doc, idx);
       if (idHits.length === 1) {
-        return { mode: 'direct', revealed: false, models: [toInfo(idHits[0])], source: 'page-data' };
+        return { mode: 'direct', revealed: false, models: [toInfo(idHits[0])], source: 'page-data', indicators: indicators };
       }
       if (idHits.length === 2) {
-        return { mode: 'battle', revealed: true, models: idHits.map((m) => toInfo(m)), source: 'page-data' };
+        return { mode: 'battle', revealed: true, models: idHits.map((m) => toInfo(m)), source: 'page-data', indicators: indicators };
       }
       if (idHits.length > 2) {
         // agent 页会内嵌几十个模型 id 的名单（如可用模型 roster），不是对战揭晓：
         // 3 个及以上命中判存疑，不下结论，候选名单进诊断供定位。
-        return { mode: 'unknown', revealed: false, models: [], source: 'page-data-ambiguous', candidates: idHits.map((m) => toInfo(m)) };
+        return { mode: 'unknown', revealed: false, models: [], source: 'page-data-ambiguous', candidates: idHits.map((m) => toInfo(m)), indicators: indicators };
       }
     }
-    return { mode: 'unknown', revealed: false, models: [], source: 'none' };
+    return { mode: 'unknown', revealed: false, models: [], source: 'none', indicators: indicators };
   }
 
   return { detect: detect, stats: stats };

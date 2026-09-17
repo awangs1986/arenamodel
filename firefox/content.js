@@ -14,10 +14,282 @@
   let listFoundOnPage = false;
   // 最近一次识别的存疑候选（页面数据命中 ≥3 个时），只进诊断不进结论。
   let lastCandidates = [];
+  /* 探针进化（#3–#7）：证据收集与融合。
+   * 证据池按轮隔离（run.sess/run.runId 对照），纯判定数学在 evidence.js；
+   * 这里只负责收证据、调 classify、写 storage。 */
+  const evPool = [];
+  function poolPush(ev) {
+    try {
+      if (!ev || typeof ev !== 'object') return;
+      ev.sess = ((diag.net.run && diag.net.run.sess) || '');
+      ev.runId = ((diag.net.run && diag.net.run.runId) || '');
+      ev.t = Date.now();
+      if (ev.weight == null) ev.weight = 0.5;
+      evPool.push(ev);
+      if (evPool.length > 60) evPool.splice(0, evPool.length - 60);
+    } catch (eP) {}
+  }
+  function poolForCurRound() {
+    try {
+      const sess = ((diag.net.run && diag.net.run.sess) || '');
+      const rid = ((diag.net.run && diag.net.run.runId) || '');
+      return evPool.filter((e) => {
+        if (!e) return false;
+        if (sess && e.sess && e.sess !== sess) return false;
+        if (rid && e.runId && e.runId !== rid) return false;
+        return true;
+      });
+    } catch (eF) { return []; }
+  }
+
+  /* 学习档案：chrome.storage.local 持久化（verified 条目只有定案来源可写）。 */
+  const learnedStore = {
+    load() {
+      try {
+        const raw = localStorage.getItem('knowmodel.learned.v1');
+        if (raw) {
+          const d = JSON.parse(raw);
+          if (d && Array.isArray(d.entries)) return d;
+        }
+      } catch (eL) {}
+      return { entries: [] };
+    },
+    save(db) {
+      try { localStorage.setItem('knowmodel.learned.v1', JSON.stringify(db)); } catch (eS) {}
+    },
+    clear() {
+      try { localStorage.removeItem('knowmodel.learned.v1'); } catch (eC) {}
+    },
+  };
+  function initLearned() {
+    try {
+      if (typeof KMP_LEARNED === 'undefined') return;
+      KMP_LEARNED.setStore({
+        load() {
+          return new Promise((resolve) => {
+            try {
+              ext.storage.local.get(['knowmodelLearned']).then((r) => {
+                const d = r && r.knowmodelLearned;
+                if (d && Array.isArray(d.entries)) return resolve(d);
+                resolve(learnedStore.load());
+              }).catch(() => resolve(learnedStore.load()));
+            } catch (eG) { resolve(learnedStore.load()); }
+          });
+        },
+        save(db) {
+          try {
+            ext.storage.local.set({ knowmodelLearned: db }).catch(() => {
+              try { learnedStore.save(db); } catch (eF2) {}
+            });
+          } catch (eS2) {
+            try { learnedStore.save(db); } catch (eF3) {}
+          }
+        },
+        clear() {
+          try {
+            ext.storage.local.remove(['knowmodelLearned']).catch(() => {});
+            learnedStore.clear();
+          } catch (eC2) {}
+        },
+      });
+    } catch (eI) {}
+  }
+  try { initLearned(); } catch (eI2) {}
+
+  /* 轮内热 id 提升：慢轮等待期里 /out/records 把 run token 明文摆出来
+   * （recordsWith(RUNJWT) 的 turn-complete 头），page-world 收不到就喂一次。 */
+  function promoteHotId() {
+    try {
+      if (typeof KMP_LEARNED === 'undefined' || !KMP_LEARNED.findByModelId) return;
+      const ids = [];
+      try {
+        const doc = (typeof document !== 'undefined') ? document : null;
+        const html = doc && doc.documentElement ? (doc.documentElement.outerHTML || '') : '';
+        const re = /\baccounts\/[a-z0-9_-]+\/models\/[a-z0-9][a-z0-9._-]{1,80}/gi;
+        let m;
+        while ((m = re.exec(html)) && ids.length < 5) {
+          if (ids.indexOf(m[0]) < 0) ids.push(m[0]);
+        }
+      } catch (eH) {}
+      try {
+        const logs = ((diag && diag.net && (diag.net.tapLog || diag.net.streams)) || []).slice(-20);
+        for (const s of logs) {
+          const heads = [s.u, s.head, s.bs].filter(Boolean).join(' ');
+          const re2 = /\baccounts\/[a-z0-9_-]+\/models\/[a-z0-9][a-z0-9._-]{1,80}/gi;
+          let m2;
+          while ((m2 = re2.exec(heads)) && ids.length < 8) {
+            if (ids.indexOf(m2[0]) < 0) ids.push(m2[0]);
+          }
+        }
+      } catch (eL2) {}
+      for (const id of ids) {
+        try {
+          const hit = KMP_LEARNED.findByModelId(id);
+          if (hit && hit.resolved) {
+            poolPush({ source: 'archive.hit', weight: 0.55, modelId: hit.resolved, detail: '档案命中 ' + id, round: true });
+            break;
+          }
+          const parsed = KMP_FUSION.parseCodename(id);
+          if (parsed && parsed.family && !parsed.anonymous) {
+            poolPush({ source: 'codename.hint', weight: 0.40, family: parsed.family, detail: '代号线索 ' + (parsed.hints[0] || id), round: true });
+            break;
+          }
+        } catch (eP2) {}
+      }
+    } catch (ePH) {}
+  }
+
+  /* 本地证据组装：URL/选择器结论 → idmap.resolve；目录精确映射；indicators。 */
+  function buildLocalEvidence(st, models) {
+    const evs = [];
+    try {
+      if (typeof KMP_FUSION === 'undefined') return evs;
+      const byId = Object.create(null);
+      for (const m of models || []) {
+        if (m && m.id) byId[String(m.id).toLowerCase()] = m;
+        if (m && m.publicName) byId[String(m.publicName).toLowerCase()] = m;
+      }
+      for (const m of (st && st.models) || []) {
+        const key = String((m && (m.id || m.publicName)) || '').toLowerCase();
+        if (!key) continue;
+        const hit = byId[key];
+        if (hit) {
+          evs.push({ source: 'idmap.resolve', weight: 0.92, modelId: hit.publicName || hit.id, detail: '目录精确映射', round: true });
+        } else if (key) {
+          evs.push({ source: 'dom.text', weight: 0.45, modelId: key.slice(0, 120), detail: 'DOM 文本', round: true });
+        }
+      }
+      for (const ind of (st && st.indicators) || []) {
+        const v = String(ind.value || '').slice(0, 160);
+        if (!v) continue;
+        if (KMP_FUSION.matchKnownModels(v).length) {
+          evs.push({ source: 'sse.chunk.model', weight: 0.90, modelId: v.slice(0, 120), detail: ind.signal || '流文本', round: true });
+        }
+      }
+    } catch (eB) {}
+    return evs;
+  }
+
+  function codenameOf(models) {
+    try {
+      if (typeof KMP_FUSION === 'undefined' || !models || !models.length) return null;
+      const raw = String(models[0].publicName || models[0].id || '');
+      if (!raw) return null;
+      const p = KMP_FUSION.parseCodename(raw);
+      if (!p || (!p.anonymous && !p.hints.length && !p.family)) return null;
+      return { raw: p.raw, anonymous: !!p.anonymous, hints: p.hints, family: p.family || null };
+    } catch (eC) { return null; }
+  }
+
+  async function classifyAndDecorate(base, localEvs) {
+    const F = (typeof KMP_FUSION === 'undefined') ? null : KMP_FUSION;
+    let evs = poolForCurRound().concat(localEvs || []);
+    if (!evs.length) evs = [{ source: 'dom.text', weight: 0.45, detail: '无证据', round: true }];
+    let verdict = { mode: 'UNKNOWN', confidence: 0, label: '未识别', evidence: [] };
+    if (F) {
+      try { verdict = F.classify(evs); } catch (eV) {}
+    }
+    let payload = F
+      ? F.assemblePayload(null, Object.assign({}, base, { codename: codenameOf(base.models) }), verdict)
+      : Object.assign({ kind: 'unknown', confidence: 0, evidence: [] }, base);
+    // 定案写入档案（只有 run-trace / 投票揭晓这类权威来源）。
+    try {
+      if (typeof KMP_LEARNED !== 'undefined' && payload.kind === 'resolved' &&
+          (payload.source === 'run-trace' || payload.source === 'reveal')) {
+        const nm = payload.models && payload.models[0] && (payload.models[0].publicName || payload.models[0].id);
+        if (nm) KMP_LEARNED.recordRealModel(nm, { runId: ((diag.net.run && diag.net.run.runId) || '') });
+      }
+    } catch (eR) {}
+    return payload;
+  }
+
+  /* 融合落盘：base（形状）+ localEvs → classify → 同 URL 旧结论保护 → 写存储。 */
+  async function fuseAndEmit(base, localEvs, opt, prevOverride) {
+    opt = opt || {};
+    let payload = await classifyAndDecorate(base, localEvs);
+    try {
+      let prev = null;
+      if (prevOverride !== undefined) {
+        prev = prevOverride;
+      } else {
+        const r = await ext.storage.local.get(['currentChat']);
+        prev = r && r.currentChat;
+      }
+      if (!opt.force && prev && prev.url === payload.url && prev.models && prev.models.length) {
+        const prevResolved = prev.kind === 'resolved' || prev.source === 'run-trace';
+        const curResolved = payload.kind === 'resolved';
+        const sameTraceName = prev.source === 'run-trace' && payload.source === 'run-trace' &&
+          ((prev.models[0] || {}).publicName) === ((payload.models[0] || {}).publicName);
+        if ((prevResolved && !curResolved) || sameTraceName) {
+          payload = Object.assign({}, prev, { updatedAt: payload.updatedAt });
+        }
+      }
+    } catch (eP3) {
+      /* 读不到旧结论就直接写新结论 */
+    }
+    try {
+      await ext.storage.local.set({ currentChat: payload });
+      KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
+    } catch (eW) {}
+    return payload;
+  }
+
+  try {
+    window.addEventListener('knowmodel-evidence', function (ev) {
+      try {
+        const evs = (ev && ev.detail && ev.detail.evs) || [];
+        for (const e of evs) poolPush(e);
+        const txt = (ev && ev.detail && ev.detail.text) || '';
+        if (txt) maybeProbeEvidence(txt);
+      } catch (eE) {}
+    });
+  } catch (eL) {}
+
+  /* 行为探针发送门状态（PelicanSend 同源安全阀）：默认关闭。 */
+  function probeArmState() {
+    return { armed: false, editorCount: 0, draftConflict: false, routeStable: false, lastSentAt: 0, now: Date.now() };
+  }
+  async function refreshProbeArm() {
+    const st = probeArmState();
+    try {
+      const r = await ext.storage.local.get(['knowmodelProbeOn']);
+      st.armed = !!(r && r.knowmodelProbeOn);
+      if (!st.armed) return st;
+      const doc = (typeof document !== 'undefined') ? document : null;
+      const boxes = doc ? doc.querySelectorAll('textarea, [contenteditable="true"]') : [];
+      st.editorCount = boxes ? boxes.length : 0;
+      st.routeStable = true;
+    } catch (ePA) {}
+    return st;
+  }
+  async function onProbeSend(canary) {
+    try {
+      if (typeof KMP_FUSION === 'undefined' || !canary) return;
+      const st = await refreshProbeArm();
+      st.now = Date.now();
+      const gate = KMP_FUSION.shouldSendProbe(st);
+      if (!gate.ok) { try { diagNote(gate.reason, 'probeGate'); } catch (eG) {} return; }
+      await fetch(location.href, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+      try { diag.probeSentAt = Date.now(); await persistDiag(); } catch (eD) {}
+    } catch (ePS) {}
+  }
+  function maybeProbeEvidence(answerText) {
+    try {
+      if (typeof KMP_FUSION === 'undefined' || !answerText) return;
+      const evs = KMP_FUSION.runCanaries(answerText);
+      for (const e of evs) {
+        e.round = true;
+        poolPush(e);
+      }
+      if (evs.length) {
+        try { diag.probeEvs = (diag.probeEvs || 0) + evs.length; persistDiag(); } catch (eD2) {}
+      }
+    } catch (eM) {}
+  }
 
   // TEMP-DIAG：诊断快照——只记 pipeline 状态与 opaque id，不含聊天正文。
   let diag = {
-    build: '20260919-dual-gate',
+    build: '20260920-evidence-fusion',
     url: location.href,
     title: document.title || '',
     verbose: false,
@@ -137,6 +409,8 @@
       const models = await getStoredModels();
       const st = KnowModelDetector.detect(location.href, document, models, { deep: !!deep });
       lastCandidates = ((st && st.candidates) || []).map((m) => (m && m.publicName) || '');
+
+
       let payload = {
         mode: st.mode,
         revealed: !!st.revealed,
@@ -185,9 +459,8 @@
       } catch (e) {
         /* 读不到旧结论就直接写新结论 */
       }
-      await ext.storage.local.set({ currentChat: payload });
-      KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
-      log('detect', deep ? 'deep' : 'light', payload.mode, payload.source);
+      payload = await fuseAndEmit(payload, buildLocalEvidence(st, models), { url: location.href, force: force }, undefined);
+      log('detect', deep ? 'deep' : 'light', payload.mode, payload.source, payload.kind || '');
       return payload;
     } catch (e) {
       diagNote(e, 'updateCurrentChat');
@@ -254,7 +527,7 @@
       }
       const prevCount = ((cur && cur.models) || []).length;
       if (!merged.length || merged.length === prevCount) return;
-      const payload = {
+      let payload = {
         mode: merged.length === 1 ? 'direct' : 'battle',
         revealed: merged.length > 1,
         models: merged.slice(0, 2),
@@ -262,8 +535,13 @@
         url: location.href,
         updatedAt: Date.now(),
       };
-      await ext.storage.local.set({ currentChat: payload });
-      KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
+      try {
+        if (typeof KMP_LEARNED !== 'undefined') {
+          KMP_LEARNED.learnFromObservation({ text: String(fromUrl || ''), modelIds: ids.slice(0, 8) }, []);
+        }
+      } catch (eLearn) {}
+      try { promoteHotId(); } catch (eHot) {}
+      payload = await fuseAndEmit(payload, buildLocalEvidence({ models: payload.models, indicators: [] }, models), { url: location.href }, cur);
     } catch (e) {
       diagNote(e, 'onNetHit');
     }
@@ -755,6 +1033,15 @@
       } catch (e) {}
     }
     try { setTimeout(maybeDirectToken, 8000); } catch (e) {}
+  try {
+    window.addEventListener('knowmodel-probe-fire', function () {
+      try {
+        if (typeof KMP_FUSION === 'undefined') return;
+        const pack = (KMP_FUSION.CANARIES || [])[0];
+        if (pack) onProbeSend(pack).catch(function () {});
+      } catch (eF) {}
+    });
+  } catch (eL2) {}
     // SPA 跳转即时通知内容世界：只靠内容世界的 2s 轮询会晚到——页面切页后立刻
     // 取新 token，而旧状态还没清，新 token 会撞上 !run.token 守卫被漏掉。
     try {
@@ -1012,6 +1299,35 @@
         if (/\/in\/append/i.test(su) || /\/out(\?|$)/i.test(su)) { try { armNextTurn(); } catch (eT2) {} }
       } catch (e) {}
     }
+    // 探针进化（#4）：协议指纹 / 响应头 / 主机证据进池。
+    // 页面世界可直调（content-script 与页面共享 window 命名空间时）；缺席则静默跳过。
+    function kmpSniff(url, bodyText, respHeaders) {
+      try {
+        if (typeof KMP_FUSION === 'undefined') return;
+        var evs = [];
+        var t = String(bodyText || '').slice(0, 4000);
+        if (t) {
+          var fps = KMP_FUSION.protocolFingerprint(t);
+          for (var i = 0; i < Math.min(2, fps.length); i++) {
+            evs.push({ source: 'protocol.framing', weight: fps[i].score, family: fps[i].family, detail: '指纹 ' + fps[i].matched.slice(0, 2).join('+'), round: true });
+          }
+        }
+        if (respHeaders && KMP_FUSION.evidenceFromHeaders) {
+          var hevs = KMP_FUSION.evidenceFromHeaders(respHeaders, url);
+          for (var j = 0; j < hevs.length; j++) { hevs[j].round = true; evs.push(hevs[j]); }
+        }
+        if (url) {
+          var v = KMP_FUSION.vendorOfHost(url);
+          if (v) evs.push({ source: 'url.host.vendor', weight: v.weight, family: v.family, detail: '主机', round: true });
+        }
+        if (evs.length) {
+          try {
+            window.dispatchEvent(new CustomEvent('knowmodel-evidence', { detail: { evs: evs.slice(0, 6) } }));
+          } catch (eD) {}
+        }
+      } catch (eS) {}
+    }
+    
     try {
       var origFetch = window.fetch;
       // 防重包（学原版 __probeWrapped）：SPA/二次注入不再叠床架屋，否则 taps 双计。
@@ -1248,7 +1564,7 @@
         if (m && m.publicName && String(m.publicName).toLowerCase() === nl) { hit = m; break; }
       }
       const info = hit ? infoOf(hit) : { publicName: name, organization: '', id: 'trace:' + runId, capabilities: [] };
-      const payload = {
+      let payload = {
         mode: 'direct',
         revealed: false,
         models: [info],
@@ -1256,8 +1572,18 @@
         url: location.href,
         updatedAt: Date.now(),
       };
-      await ext.storage.local.set({ currentChat: payload });
-      KnowModelBadge.show(document, KnowModelBadge.textFor(payload));
+      poolPush({ source: 'run.trace.model', weight: 1.00, modelId: name, detail: 'run ' + String(runId || '').slice(0, 24), round: true });
+      try {
+        if (typeof KMP_LEARNED !== 'undefined' && name) {
+          KMP_LEARNED.recordRealModel(name, { runId: runId || '' });
+          try { KMP_LEARNED.backfillNames(); } catch (eBf) {}
+          const hit = KMP_LEARNED.findByModelId(name);
+          if (hit && hit.resolved && hit.resolved !== name) {
+            payload.models = [{ publicName: hit.resolved, organization: '', id: 'archive:' + hit.id, capabilities: [] }];
+          }
+        }
+      } catch (eRec) {}
+      payload = await fuseAndEmit(payload, [], { url: location.href }, cur);
       try {
         diag.lastRunName = name;
         diag.lastRunId = runId;
@@ -1316,6 +1642,30 @@
   } catch (e) {
     /* 极端环境跳过 */
   }
+  // 测试缝：融合管线入口（证据→判定→落盘）。页面世界同样可见（无害：只发
+  // 本地 CustomEvent / 读本地 storage，不触网；生产环境未使用）。
+  try {
+    window.__kmpTest = {
+      evidence: function (evs, text) {
+        try {
+          window.dispatchEvent(new CustomEvent('knowmodel-evidence', { detail: { evs: evs || [], text: text || '' } }));
+        } catch (eT) {}
+      },
+      runModel: function (name, runId) {
+        try {
+          window.dispatchEvent(new CustomEvent('knowmodel-run-model', { detail: { name: name, runId: runId } }));
+        } catch (eT2) {}
+      },
+      fuse: function (base) {
+        return (async function () {
+          try {
+            const models = await getStoredModels();
+            return await fuseAndEmit(base, buildLocalEvidence({ models: base.models, indicators: [] }, models), { url: location.href, force: true }, null);
+          } catch (eTF) { return null; }
+        })();
+      },
+    };
+  } catch (eT3) {}
 
   try {
     ext.storage.local.get(['knowmodelVerbose']).then((r) => {
