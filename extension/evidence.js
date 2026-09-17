@@ -644,9 +644,50 @@ var KMP_LEARNED = (() => {
   }
   function load() {
     try {
-      if (_store) { var d = _store.load(); if (d && Array.isArray(d.entries)) return d; }
+      if (_store) {
+        var d = _store.load();
+        // store 必须是同步的：返回 Promise 说明注入端没做同步缓存，
+        // 此时读空比读一个"永远 resolving 的假象"更诚实（调用方全同步）。
+        if (d && typeof d.then === 'function') return { entries: [], _asyncStore: true };
+        if (d && Array.isArray(d.entries)) return d;
+      }
     } catch (e) {}
     return { entries: [] };
+  }
+  // 双源合并（本地同步种子 + 云端异步快照）：按 id 去重，verified 优先，
+  // 否则 count 大者胜；runIds 并集（cap 10），lastSeen 取大。纯函数，可单测。
+  function mergeDbs(a, b) {
+    var out = { entries: [] };
+    var byId = {};
+    function put(en) {
+      if (!en || typeof en !== 'object') return;
+      var key = String(en.id || en.resolved || '').trim().toLowerCase();
+      if (!key) return;
+      var cur = byId[key];
+      if (!cur) { cur = {}; byId[key] = cur; out.entries.push(cur); }
+      var SKIP = { runIds: 1, verified: 1, status: 1, count: 1, lastSeen: 1, firstSeen: 1 };
+      for (var k in en) { if (!SKIP[k] && en.hasOwnProperty(k)) cur[k] = en[k]; }
+      // verified 优先保留：后来的未验证条目不许覆盖已定案
+      if (en.verified) { cur.verified = true; cur.status = en.status || cur.status; }
+      else if (!cur.verified && en.status) cur.status = en.status;
+      var seen = {};
+      var runs = [];
+      function addRuns(arr) {
+        for (var i = 0; i < (arr || []).length && runs.length < 10; i++) {
+          var r = String(arr[i]);
+          if (r && !seen[r]) { seen[r] = true; runs.push(r); }
+        }
+      }
+      addRuns(cur.runIds); addRuns(en.runIds);
+      cur.runIds = runs;
+      cur.count = Math.max(cur.count || 0, en.count || 0);
+      cur.lastSeen = Math.max(cur.lastSeen || 0, en.lastSeen || 0);
+      if (!cur.firstSeen || (en.firstSeen && en.firstSeen < cur.firstSeen)) cur.firstSeen = en.firstSeen || cur.firstSeen;
+    }
+    var la = (a && a.entries) || [], lb = (b && b.entries) || [];
+    for (var i = 0; i < la.length; i++) put(la[i]);
+    for (var j = 0; j < lb.length; j++) put(lb[j]);
+    return out;
   }
   function save(db) {
     try {
@@ -886,6 +927,7 @@ var KMP_LEARNED = (() => {
     stats: stats,
     exportLearned: exportLearned,
     importLearned: importLearned,
+    mergeDbs: mergeDbs,
     listLearned: listLearned,
     clearLearned: clearLearned,
   };

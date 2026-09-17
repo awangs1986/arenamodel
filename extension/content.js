@@ -61,22 +61,30 @@
       try { localStorage.removeItem('knowmodel.learned.v1'); } catch (eC) {}
     },
   };
+  // 档案同步缓存：KMP_LEARNED 全同步读写，chrome.storage 却是异步。
+  // 修：之前注入的 load() 返回 Promise，读侧永远读空（回填/命中全死），
+  // 写侧每次从空库起步（只留最后一条）。现在内存缓存 + 双写 + 启动即刷新。
+  let learnedCache = null;
   function initLearned() {
     try {
       if (typeof KMP_LEARNED === 'undefined') return;
+      try { learnedCache = learnedStore.load(); } catch (eSeed) { learnedCache = { entries: [] }; }
+      if (!learnedCache || !Array.isArray(learnedCache.entries)) learnedCache = { entries: [] };
+      try {
+        ext.storage.local.get(['knowmodelLearned']).then((r) => {
+          try {
+            const d = r && r.knowmodelLearned;
+            if (d && Array.isArray(d.entries)) learnedCache = KMP_LEARNED.mergeDbs(learnedCache, d);
+          } catch (eM) {}
+        }).catch(() => {});
+      } catch (eR) {}
       KMP_LEARNED.setStore({
         load() {
-          return new Promise((resolve) => {
-            try {
-              ext.storage.local.get(['knowmodelLearned']).then((r) => {
-                const d = r && r.knowmodelLearned;
-                if (d && Array.isArray(d.entries)) return resolve(d);
-                resolve(learnedStore.load());
-              }).catch(() => resolve(learnedStore.load()));
-            } catch (eG) { resolve(learnedStore.load()); }
-          });
+          if (learnedCache && Array.isArray(learnedCache.entries)) return learnedCache;
+          try { return learnedStore.load(); } catch (eG2) { return { entries: [] }; }
         },
         save(db) {
+          try { learnedCache = db; } catch (eC0) {}
           try {
             ext.storage.local.set({ knowmodelLearned: db }).catch(() => {
               try { learnedStore.save(db); } catch (eF2) {}
@@ -84,6 +92,7 @@
           } catch (eS2) {
             try { learnedStore.save(db); } catch (eF3) {}
           }
+          try { learnedStore.save(db); } catch (eF4) {}
         },
         clear() {
           try {
@@ -140,7 +149,7 @@
   }
 
   /* 本地证据组装：URL/选择器结论 → idmap.resolve；目录精确映射；indicators。 */
-  function buildLocalEvidence(st, models) {
+  function buildLocalEvidence(st, models, trustArchive) {
     const evs = [];
     try {
       if (typeof KMP_FUSION === 'undefined') return evs;
@@ -155,6 +164,16 @@
         const hit = byId[key];
         if (hit) {
           evs.push({ source: 'idmap.resolve', weight: 0.92, modelId: hit.publicName || hit.id, detail: '目录精确映射', round: true });
+        } else if (trustArchive && typeof KMP_LEARNED !== 'undefined' && KMP_LEARNED.findByModelId) {
+          // 网络命中 + 档案 verified（定案写过档）：按档案回填，不按 DOM 文本计。
+          // DOM 文本默认不走这条（trustArchive=false），防聊天记录偶然提及误定案。
+          let archived = null;
+          try { archived = KMP_LEARNED.findByModelId(key); } catch (eAH2) {}
+          if (archived && archived.verified && archived.resolved) {
+            evs.push({ source: 'archive.hit', weight: 0.55, modelId: archived.resolved, detail: '档案定案回填', round: true });
+          } else if (key) {
+            evs.push({ source: 'dom.text', weight: 0.45, modelId: key.slice(0, 120), detail: 'DOM 文本', round: true });
+          }
         } else if (key) {
           evs.push({ source: 'dom.text', weight: 0.45, modelId: key.slice(0, 120), detail: 'DOM 文本', round: true });
         }
@@ -523,6 +542,19 @@
         if (m && !have[m.id]) {
           have[m.id] = true;
           merged.push(infoOf(m));
+        } else if (!m && typeof KMP_LEARNED !== 'undefined' && KMP_LEARNED.findByModelId) {
+          // 未收录：只有档案 verified（定案写过档的权威名）才认，野 id 直接丢。
+          // 修：老对话里 run trace 吐出目录外新名（如 super_nova_ext），网络侧
+          // 命中却因不在目录被整单丢弃 → 永久未检测到。
+          let ah = null;
+          try { ah = KMP_LEARNED.findByModelId(id); } catch (eAH3) {}
+          const rnm = ah && ah.verified && ah.resolved;
+          const hk = String(rnm || '').toLowerCase();
+          if (rnm && !have[hk]) {
+            have[hk] = true;
+            merged.push({ publicName: rnm, organization: '', id: 'archive:' + (ah.id || id), capabilities: [] });
+            poolPush({ source: 'archive.hit', weight: 0.55, modelId: rnm, detail: '档案定案 ' + String(id).slice(0, 60), round: true });
+          }
         }
       }
       const prevCount = ((cur && cur.models) || []).length;
@@ -541,7 +573,7 @@
         }
       } catch (eLearn) {}
       try { promoteHotId(); } catch (eHot) {}
-      payload = await fuseAndEmit(payload, buildLocalEvidence({ models: payload.models, indicators: [] }, models), { url: location.href }, cur);
+      payload = await fuseAndEmit(payload, buildLocalEvidence({ models: payload.models, indicators: [] }, models, true), { url: location.href }, cur);
     } catch (e) {
       diagNote(e, 'onNetHit');
     }
@@ -786,12 +818,15 @@
       ];
       function evAttempt(i) {
         var cfg = evUrls[Math.min(i, evUrls.length - 1)];
+        var via = (i === 0) ? 'direct' : 'proxy';
         return fetch(cfg.u, {
           method: 'GET',
           headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/json' },
           credentials: cfg.c,
           signal: ctrl ? ctrl.signal : undefined,
         }).then(function (res) {
+          // 取证可见性：下次 found 为空时，诊断里能一眼看出是 http 失败还是零标签。
+          try { run.lastEv = { t: Date.now(), rid: String(rid || '').slice(0, 32), via: via, st: (res && res.status) || 0 }; } catch (eLE) {}
           if (!res.ok && i + 1 < evUrls.length) return evAttempt(i + 1);
           if (!res.ok) throw new Error('http-' + res.status);
           return res.text();
@@ -801,6 +836,7 @@
         done();
         run.error = '';
         var labels = extractLabels(text);
+        try { if (run.lastEv) run.lastEv.n = labels.length; } catch (eLE2) {}
         // 终局去重：处理窗口内的并发 events（慢网/轮询重叠）只有第一个
         // 回来的能派发——doneTok 一落，同 token 的后来者全部跳过。
         if (labels.length && token !== run.doneTok) {
@@ -837,6 +873,7 @@
       }).catch(function (err) {
         done();
         var msg = String((err && err.name === 'AbortError') ? 'timeout-20s' : ((err && err.message) || err));
+        try { if (run.lastEv) run.lastEv.err = msg.slice(0, 40); else run.lastEv = { t: Date.now(), rid: String(rid || '').slice(0, 32), err: msg.slice(0, 40) }; } catch (eLE3) {}
         run.error = msg.slice(0, 80);
         if (run.tries >= 30) {
           // 事件路连败 30 次：回看哨态降频续命，别死。
@@ -1016,10 +1053,22 @@
         }).catch(function () { return ''; }).then(function (t1) {
           var m1 = null;
           try { m1 = TOKEN_JSON_RE.exec(t1 || ''); } catch (e) {}
-          if (m1 && m1[1]) { deliver(t1, 'trig'); return; }
-          return fetch('/api/me/pulse', { credentials: 'same-origin' }).then(function (res2) {
-            return (res2 && res2.ok) ? res2.text() : '';
-          }).catch(function () { return ''; }).then(function (t2) { deliver(t2, 'pulse'); });
+          if (m1 && m1[1]) { deliver(t1, 'trig'); return null; }
+          // GET 被 403（Route not allowed）时换 POST 再试：SPA 的调用成功，
+          // 疑正门只认 POST；空 JSON 幂等，与 SPA 开会话行为一致。
+          return fetch('/api/chat/trigger-token', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(function (resP) {
+            return (resP && resP.ok) ? resP.text() : '';
+          }).catch(function () { return ''; }).then(function (t1p) {
+            var m1p = null;
+            try { m1p = TOKEN_JSON_RE.exec(t1p || ''); } catch (eP2) {}
+            if (m1p && m1p[1]) { deliver(t1p, 'trig-post'); return null; }
+            return 'go-pulse';
+          });
+        }).then(function (tPostDone) {
+          if (tPostDone !== 'go-pulse') return;
+            return fetch('/api/me/pulse', { credentials: 'same-origin' }).then(function (res2) {
+              return (res2 && res2.ok) ? res2.text() : '';
+            }).catch(function () { return ''; }).then(function (t2) { deliver(t2, 'pulse'); });
         }).catch(function () { try { tokenFetching = false; } catch (e) {} });
       } catch (e) { try { tokenFetching = false; } catch (e2) {} }
     }
@@ -1191,7 +1240,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260919-dual-gate', hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260920-evidence-fusion', lastEv: run.lastEv || null, hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );

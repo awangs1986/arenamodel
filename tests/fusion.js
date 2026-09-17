@@ -174,3 +174,24 @@ assert.ok(F && L, 'KMP_FUSION/KMP_LEARNED 已加载');
   assert.ok(a.p_anthropic === 1 && a.has_toolu === 1, 'AC 维度: ' + JSON.stringify(a));
   console.log('AC cosine similarity: PASS');
 }
+
+// AD. 权威证据不因目录缺席降级：run.trace 1.00 的未收录名照样 RESOLVED（线上
+// super_nova_ext 定案语义锁定：trace 说是谁就是谁，不查目录脸色）
+{
+  const v = F.classify([{ source: 'run.trace.model', weight: 1.00, modelId: 'super_nova_ext', detail: 'run run_x' }]);
+  assert.strictEqual(v.mode, 'RESOLVED', 'AD 未收录权威名定案: ' + JSON.stringify({ mode: v.mode, conf: v.confidence }));
+  assert.strictEqual(v.modelId, 'super_nova_ext', 'AD 名原样: ' + v.modelId);
+  assert.ok(v.confidence >= 0.55, 'AD 置信度: ' + v.confidence);
+  console.log('AD unlisted authority resolves: PASS');
+}
+
+// AE. 档案双源合并：verified 不被后来的未验证覆盖；runIds 并集；count 取大
+{
+  const a = { entries: [{ id: 'v_x', modelIds: ['m'], resolved: 'm', verified: true, status: 'VERIFIED_UNLISTED', count: 2, runIds: ['r1'], lastSeen: 10, firstSeen: 10 }] };
+  const b = { entries: [{ id: 'v_x', modelIds: ['m'], resolved: 'm', verified: false, status: 'UNSEEN', count: 5, runIds: ['r2'], lastSeen: 20, firstSeen: 5 }] };
+  const m = L.mergeDbs(a, b);
+  assert.strictEqual(m.entries.length, 1, 'AE 去重');
+  assert.ok(m.entries[0].verified && m.entries[0].status === 'VERIFIED_UNLISTED', 'AE 定案优先: ' + JSON.stringify({ v: m.entries[0].verified, s: m.entries[0].status }));
+  assert.ok(m.entries[0].runIds.length === 2 && m.entries[0].count === 5 && m.entries[0].lastSeen === 20 && m.entries[0].firstSeen === 5, 'AE 合并: ' + JSON.stringify(m.entries[0]));
+  console.log('AE archive merge: PASS');
+}

@@ -415,4 +415,46 @@ function pageWorld(route) {
     assert.ok(cc && typeof cc.kind === 'string' && Array.isArray(cc.evidence), 'AF 形状安全: ' + JSON.stringify(cc && {kind: cc.kind, ev: cc.evidence && cc.evidence.length}));
     console.log('AF inferred-path safe: PASS');
   }
+  // AG. 未收录权威名网络命中：本 boot 先经 runModel 定案建档（onRunModel
+  // 未收录可定案），清盘后只走 net-hit → 档案回填 resolved，不再因目录缺席丢弃
+  {
+    const b = await boot();
+    const runInBoot = (src) => vm.runInContext(src, b);
+    delete sharedStore.currentChat;
+    runInBoot(`window.__kmpTest.runModel('super_nova_ext', 'run_AG')`);
+    await sleep(80);
+    delete sharedStore.currentChat;
+    runInBoot(`window.dispatchEvent(new CustomEvent('knowmodel-net-hit', { detail: { ids: ['super_nova_ext'], url: location.href } }))`);
+    await sleep(80);
+    const cc = sharedStore.currentChat;
+    assert.ok(cc && cc.kind === 'resolved' && cc.source === 'network', 'AG 未收录定案: ' + JSON.stringify(cc && {kind: cc.kind, source: cc.source, m: cc.models && cc.models[0]}));
+    assert.ok(cc.models[0] && /super_nova_ext/.test(cc.models[0].publicName || ''), 'AG 名: ' + JSON.stringify(cc.models[0]));
+    console.log('AG unlisted archived net-hit resolves: PASS');
+  }
+
+  // AH. 野 id（不在目录、不在档案）→ 不定案、不落盘
+  {
+    const b = await boot();
+    const runInBoot = (src) => vm.runInContext(src, b);
+    delete sharedStore.currentChat;
+    runInBoot(`window.dispatchEvent(new CustomEvent('knowmodel-net-hit', { detail: { ids: ['wild_unknown_model_xyz'], url: location.href } }))`);
+    await sleep(80);
+    assert.ok(!sharedStore.currentChat, 'AH 野 id 不落盘');
+    console.log('AH wild id ignored: PASS');
+  }
+
+  // AI. events 双路失败可见：lastEv 记 err，下次 found 为空不再是黑盒
+  {
+    const w = pageWorld((url, body) => {
+      if (url.includes('trigger-token') || url.includes('me/pulse')) return body(JSON.stringify({token: SESSJWT}), 'application/json');
+      if (url.includes('/out/records')) return body(recordsWith(RUNJWT), 'application/json');
+      if (url.includes('/runs/')) return { ok: false, status: 500, headers: { get: () => 'application/json' }, text: async () => 'boom' };
+      return body('{}', 'application/json');
+    });
+    await vm.runInContext('fetch("https://arena.ai/api/chat/trigger-token").then(r=>r.text())', w.ctx);
+    await w.settle(6);
+    const st = w.stats();
+    assert.ok(st.lastEv && st.lastEv.err && /http-500/.test(st.lastEv.err), 'AI lastEv: ' + JSON.stringify(st.lastEv));
+    console.log('AI events failure visible: PASS');
+  }
 })().catch((e) => { console.error('FAIL:', e && e.stack || e); process.exit(1); });
