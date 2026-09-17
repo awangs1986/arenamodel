@@ -767,6 +767,41 @@
       // 收下只会占槽（!run.token 守卫挡掉之后的新 token）再判 token-expired 走死。
       // 无 exp 声明则放行（无法判断）。自救/自取的新 token 自然新鲜，不受影响。
       if (exp && Date.now() > exp * 1000) return;
+      // 同会话 sess token 重播（SPA 每次 out/records 都带 Authorization 头，
+      // tap 每轮都喂一次，线上 accepts 里 hdr:Authorization rid 为空的就是它）：
+      // 只续 sessTok/sessExp，绝不 reset 进行中的 run 链。之前每次重播都走
+      // 全 reset，把 doneTok/found/fetches 清零 → 定案闪现又灭、事件轮询永不
+      // 收敛（16 秒 8 次 accept 的主凶）。只有 sid 变了（真正切会话）才往下走。
+      var sidNow = null;
+      try { sidNow = sessionIdFromToken(token); } catch (eSN) {}
+      if (!rid && sidNow && run.sess && sidNow === run.sess) {
+        run.sessTok = token;
+        run.sessExp = exp;
+        emitStats();
+        return;
+      }
+      // 同 run 的 token 轮换（records 每次返回 fresh JWT，run id 不变）：
+      // 只换钥匙/过期，不许 reset 整条链。线上实锤：16 秒 8 次 accept 把
+      // fetches/tries/found/doneTok 反复清零 → 事件轮询永不收敛（fetches=2、
+      // found 空）；定案后 Rot 也会把 found 洗成 unknown（灯闪一下又灭）。
+      // 新 run（rid 不同）才走下面的全 reset，每轮换模型不受影响。
+      if (rid) {
+        var sameRun = (rid === run.runId);
+        if (!sameRun && run.doneTok) { try { sameRun = (rid === runIdFromToken(run.doneTok)); } catch (eSR) {} }
+        if (sameRun) {
+          run.token = token;
+          run.exp = exp;
+          // 定案标记跟钥匙一起换：这轮已定案（doneTok 落过），换钥匙不许
+          // 把“已处理”抹掉，否则下一轮 records/事件用新钥匙回来会再派发一次
+          // （线上“灯闪一下又灭又亮”的抖动）。doneTok 为空说明本轮还没定案，
+          // 保持空，让在途的 events 按原守卫正常派发。
+          if (run.doneTok) run.doneTok = token;
+          emitStats();
+          if (!run.polling) startPoll();
+          return;
+        }
+      }
+      run.lastEv = null;
       stopPoll();
       run.token = token;
       var sid = sessionIdFromToken(token);
@@ -1054,9 +1089,10 @@
           var m1 = null;
           try { m1 = TOKEN_JSON_RE.exec(t1 || ''); } catch (e) {}
           if (m1 && m1[1]) { deliver(t1, 'trig'); return null; }
-          // GET 被 403（Route not allowed）时换 POST 再试：SPA 的调用成功，
-          // 疑正门只认 POST；空 JSON 幂等，与 SPA 开会话行为一致。
-          return fetch('/api/chat/trigger-token', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(function (resP) {
+          // GET 被 403（Route not allowed）时换 POST 再试：线上 400 点名
+          // 缺 sessionId（ZodError path sessionId Required），故带上当前
+          // 会话 UUID；SPA 的调用成功，说明这条路是通的。
+          return fetch('/api/chat/trigger-token', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: triggerPostBody() }).then(function (resP) {
             return (resP && resP.ok) ? resP.text() : '';
           }).catch(function () { return ''; }).then(function (t1p) {
             var m1p = null;
@@ -1071,6 +1107,16 @@
             }).catch(function () { return ''; }).then(function (t2) { deliver(t2, 'pulse'); });
         }).catch(function () { try { tokenFetching = false; } catch (e) {} });
       } catch (e) { try { tokenFetching = false; } catch (e2) {} }
+    }
+    // trigger-token POST 体：带当前会话 UUID（正门 Zod 点名要 sessionId，
+    // 空体 400）。纯函数，挂 __kmpTest.trigBody 供回归锁定。
+    function triggerPostBody(href) {
+      try {
+        var h = (typeof href === 'string') ? href : ((typeof location !== 'undefined' && location.href) || '');
+        var mSid = /\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(h || '');
+        var sid = (mSid && mSid[1]) || '';
+        return JSON.stringify(sid ? { sessionId: sid } : {});
+      } catch (ePB) { return '{}'; }
     }
     // 自愈：snoop 就绪 8s 后仍无 token 且在会话页，自己敲一次正门；切页重来。
     function maybeDirectToken() {
@@ -1240,7 +1286,7 @@
               lastHitAt: lastHitAt,
               lastIds: lastIds.slice(0, 4),
               lastUrl: lastUrl,
-              run: { build: '20260920-evidence-fusion', lastEv: run.lastEv || null, hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
+              run: { build: '20260921-same-run-noreset', lastEv: run.lastEv || null, tries: run.tries || 0, sessTries: run.sessTries || 0, polling: !!run.polling, procTok: !!run.procTok, hasToken: !!run.token, accepts: run.accepts.slice(-8), prevSeq: (typeof run.prevSeq === 'number') ? run.prevSeq : -1, slow: !!run.slowMode, done: !!run.doneTok, runId: run.runId || '', sess: run.sess ? String(run.sess).slice(0, 8) : '', fetches: run.fetches, found: run.found || '', error: run.error || '', taps: run.taps, sockMsgs: run.sockMsgs, searchedKB: run.searchedKB, ck: (function () { try { var a = [], dc = (typeof document !== 'undefined' && document.cookie) ? document.cookie : ''; var ps = dc ? dc.split(';') : []; for (var i = 0; i < ps.length && a.length < 20; i++) { var nm = String(ps[i].split('=')[0] || '').trim(); if (nm) a.push(nm); } return a; } catch (e) { return []; } })(), streams: run.streams.slice(-25), tapLog: run.tapLog.slice(-60), reqHdrs: run.reqHdrs.slice(-12), reqRuns: run.reqRuns.slice() },
             },
           })
         );
@@ -1700,6 +1746,13 @@
           window.dispatchEvent(new CustomEvent('knowmodel-evidence', { detail: { evs: evs || [], text: text || '' } }));
         } catch (eT) {}
       },
+      trigBody: function (href) { try {
+        // 自包含（与 snoopPayload 内 triggerPostBody 同逻辑）：__kmpTest 活在内容
+        // 世界，看不见页面载荷里的函数，故此处内联同一正则，改一处记得改另一处。
+        var mS = /\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(href || '');
+        var sS = (mS && mS[1]) || '';
+        return JSON.stringify(sS ? { sessionId: sS } : {});
+      } catch (eT2) { return '{}'; } },
       runModel: function (name, runId) {
         try {
           window.dispatchEvent(new CustomEvent('knowmodel-run-model', { detail: { name: name, runId: runId } }));

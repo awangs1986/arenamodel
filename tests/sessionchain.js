@@ -12,6 +12,8 @@ const SID2 = '01a0ab89-13bf-7853-bed3-dbda2e3ba5d5';
 const SESSJWT2 = b64u({alg:'none'}) + '.' + b64u({sub:'u1', pub:true, scopes:['read:sessions:'+SID2,'write:sessions:'+SID2], iss:'https://id.trigger.dev', aud:'https://api.trigger.dev', exp:FUT, iat:FUT-3600}) + '.' + b64u('sig');
 const RUN2 = 'run_new999AAA';
 const RUNJWT2 = b64u({alg:'none'}) + '.' + b64u({sub:'u1', pub:true, scopes:['read:runs:'+RUN2], exp:FUT, iat:FUT-3600}) + '.' + b64u('sig');
+const RUNJWT_B = b64u({alg:'none'}) + '.' + b64u({sub:'u1', pub:true, scopes:['read:runs:'+RUN], exp:FUT, iat:FUT-3500}) + '.' + b64u('sigB');
+const RUNJWT_C = b64u({alg:'none'}) + '.' + b64u({sub:'u1', pub:true, scopes:['read:runs:'+RUN], exp:FUT, iat:FUT-3400}) + '.' + b64u('sigC');
 
 const EVENTS = JSON.stringify({events:[{id:'s1',text:'accounts/fireworks/models/qwen3p8-27b',icon:'tabler-cube'},{id:'s2',text:'8.5k',icon:'tabler-hash'}]});
 const EVENTS2 = JSON.stringify({events:[{id:'s1',text:'accounts/google/models/gemini-3.8-flash',icon:'tabler-cube'}]});
@@ -39,7 +41,7 @@ async function boot() {
     window: null,
     document: { querySelectorAll: () => [], body: {}, title: '',
       documentElement: { outerHTML: '', getAttribute: () => null, setAttribute: () => {}, appendChild: () => {} },
-      createElement: () => ({ set textContent(v){ INJECTED += v; }, get textContent(){ return ''; }, remove(){} }),
+      createElement: () => ({ set textContent(v){ if (!INJECTED) INJECTED = v; }, get textContent(){ return ''; }, remove(){} }),
       getElementById: () => null, head: null },
     setInterval: () => 0, clearInterval: () => {}, setTimeout: () => 0, clearTimeout: () => {}, console: console,
     chrome: { storage: { local: {
@@ -456,5 +458,42 @@ function pageWorld(route) {
     const st = w.stats();
     assert.ok(st.lastEv && st.lastEv.err && /http-500/.test(st.lastEv.err), 'AI lastEv: ' + JSON.stringify(st.lastEv));
     console.log('AI events failure visible: PASS');
+  }
+  // AJ. 同 run token 轮换不 reset：定案后 records 再吐同 run fresh JWT，
+  // 定案不丢、不重派（线上 16s 8 accept 洗掉 found 的回归锁）
+  {
+    let recTok = RUNJWT;
+    const w = pageWorld((url, body) => {
+      if (url.includes('trigger-token') || url.includes('me/pulse')) return body(JSON.stringify({token: SESSJWT}), 'application/json');
+      if (url.includes('/out/records')) return body(recordsWith(recTok), 'application/json');
+      if (url.includes('/runs/')) return body(EVENTS, 'application/json');
+      return body('{}', 'application/json');
+    });
+    await vm.runInContext('fetch("https://arena.ai/api/chat/trigger-token").then(r=>r.text())', w.ctx);
+    await w.settle(4);
+    let st = w.stats();
+    const dispatches = () => w.evs.filter((e) => e.type === 'knowmodel-run-model').length;
+    assert.ok(st.found && st.found.includes('qwen3p8-27b'), 'AJ 先定案: ' + st.found);
+    assert.strictEqual(dispatches(), 1, 'AJ 定案派发一次');
+    for (const tok of [RUNJWT_B, RUNJWT_C]) {
+      recTok = tok;
+      await vm.runInContext('fetch("https://arena.ai/ai-proxy/realtime/v1/sessions/SS/out/records").then(r=>r.text())', w.ctx);
+      await w.settle(3);
+    }
+    st = w.stats();
+    assert.ok(st.found && st.found.includes('qwen3p8-27b'), 'AJ 轮换后定案保持: ' + JSON.stringify({found: st.found, error: st.error}));
+    assert.strictEqual(dispatches(), 1, 'AJ 不重派（旧逻辑 reset 后重拉再派)');
+    console.log('AJ same-run rotation keeps verdict: PASS');
+  }
+
+  // AK. trigger-token POST 体带 sessionId（正门 Zod 点名要，空体 400）
+  {
+    const b = await boot();
+    const runInBoot = (src) => vm.runInContext(src, b);
+    const withSid = runInBoot(`window.__kmpTest.trigBody('https://arena.ai/agent/01a0aa6a-d5cb-7ddf-b735-95faf47f8cbb')`);
+    assert.ok(withSid.includes('01a0aa6a-d5cb-7ddf-b735-95faf47f8cbb') && withSid.includes('sessionId'), 'AK 带会话: ' + withSid);
+    const withoutSid = runInBoot(`window.__kmpTest.trigBody('https://arena.ai/')`);
+    assert.strictEqual(withoutSid, '{}', 'AK 非会话页退化空体');
+    console.log('AK trigger post carries sessionId: PASS');
   }
 })().catch((e) => { console.error('FAIL:', e && e.stack || e); process.exit(1); });
